@@ -138,6 +138,11 @@ harness = false
 required-features = ["benchmarking"]
 
 [[bench]]
+name = "bench_wal_batch"
+harness = false
+required-features = ["benchmarking"]
+
+[[bench]]
 name = "upload_queue"
 harness = false
 
