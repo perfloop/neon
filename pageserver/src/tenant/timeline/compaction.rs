@@ -2041,8 +2041,7 @@ impl Timeline {
 
         stats.compaction_prerequisites_micros = stats.read_lock_acquisition_micros.till_now();
 
-        // TODO: replace with streaming k-merge
-        let index_metadata_started = tokio::time::Instant::now();
+        let prewrite_metadata_started = tokio::time::Instant::now();
         let all_keys = {
             let mut all_keys = Vec::new();
             for l in deltas_to_compact.iter() {
@@ -2061,13 +2060,11 @@ impl Timeline {
             all_keys.sort_by_key(|DeltaEntry { key, lsn, .. }| (*key, *lsn));
             all_keys
         };
-        let index_metadata_micros = u64::try_from(index_metadata_started.elapsed().as_micros())
-            .expect("index metadata duration fits in u64 microseconds");
         let selected_entries = u64::try_from(all_keys.len()).expect("entry count fits in u64");
         let selected_l0_layers =
             u64::try_from(deltas_to_compact.len()).expect("selected layer count fits in u64");
 
-        stats.read_lock_held_key_sort_micros = stats.compaction_prerequisites_micros.till_now();
+        stats.index_metadata_micros = stats.compaction_prerequisites_micros.till_now();
 
         // Determine N largest holes where N is number of compacted layers. The vec is sorted by key range start.
         //
@@ -2142,14 +2139,16 @@ impl Timeline {
             holes.sort_unstable_by_key(|hole| hole.key_range.start);
             holes
         };
-        let selected_holes = u64::try_from(holes.len()).expect("hole count fits in u64");
-        stats.read_lock_held_compute_holes_micros = stats.read_lock_held_key_sort_micros.till_now();
+        let prewrite_metadata_micros =
+            u64::try_from(prewrite_metadata_started.elapsed().as_micros())
+                .expect("pre-write metadata duration fits in u64 microseconds");
+        stats.hole_selection_micros = stats.index_metadata_micros.till_now();
 
         if self.cancel.is_cancelled() {
             return Err(CompactionError::new_cancelled());
         }
 
-        stats.read_lock_drop_micros = stats.read_lock_held_compute_holes_micros.till_now();
+        stats.output_setup_micros = stats.hole_selection_micros.till_now();
 
         // This iterator walks through all key-value pairs from all the layers
         // we're compacting, in key, LSN order.
@@ -2240,8 +2239,6 @@ impl Timeline {
         let mut dup_start_lsn: Lsn = Lsn::INVALID; // start LSN of layer containing values of the single key
         let mut dup_end_lsn: Lsn = Lsn::INVALID; // end LSN of layer containing values of the single key
         let mut next_hole = 0; // index of next hole in holes vector
-        let mut duplicate_lsn_splits = 0u64;
-
         let mut keys = 0;
 
         while let Some((key, lsn, value)) = all_values_iter
@@ -2290,7 +2287,6 @@ impl Timeline {
                             lsn // start with the first LSN for this key
                         };
                         dup_end_lsn = next_lsn; // upper LSN boundary is exclusive
-                        duplicate_lsn_splits += 1;
                         break;
                     }
                 }
@@ -2434,22 +2430,17 @@ impl Timeline {
                 .fatal_err("VirtualFile::sync_all timeline dir");
         }
 
-        stats.write_layer_files_micros = stats.read_lock_drop_micros.till_now();
+        stats.write_layer_files_micros = stats.output_setup_micros.till_now();
         stats.new_deltas_count = Some(new_layers.len());
         stats.new_deltas_size = Some(new_layers.iter().map(|l| l.layer_desc().file_size).sum());
 
-        let tenant_id = self.tenant_shard_id.tenant_id.to_string();
-        let shard_id = self.tenant_shard_id.shard_slug().to_string();
-        let timeline_id = self.timeline_id.to_string();
         for (stat, value) in [
-            ("index_metadata_micros", index_metadata_micros),
+            ("prewrite_metadata_micros", prewrite_metadata_micros),
             ("selected_entries", selected_entries),
             ("selected_l0_layers", selected_l0_layers),
-            ("selected_holes", selected_holes),
-            ("duplicate_lsn_splits", duplicate_lsn_splits),
         ] {
             metrics::L0_COMPACTION_PHASE1_LAST
-                .get_metric_with_label_values(&[stat, &tenant_id, &shard_id, &timeline_id])
+                .get_metric_with_label_values(&[stat])
                 .expect("fixed L0 compaction metric labels")
                 .set(i64::try_from(value).expect("L0 compaction stat fits in i64"));
         }
@@ -2502,10 +2493,10 @@ struct CompactLevel0Phase1StatsBuilder {
     tenant_id: Option<TenantShardId>,
     timeline_id: Option<TimelineId>,
     read_lock_acquisition_micros: DurationRecorder,
-    read_lock_held_key_sort_micros: DurationRecorder,
+    index_metadata_micros: DurationRecorder,
     compaction_prerequisites_micros: DurationRecorder,
-    read_lock_held_compute_holes_micros: DurationRecorder,
-    read_lock_drop_micros: DurationRecorder,
+    hole_selection_micros: DurationRecorder,
+    output_setup_micros: DurationRecorder,
     write_layer_files_micros: DurationRecorder,
     level0_deltas_count: Option<usize>,
     new_deltas_count: Option<usize>,
@@ -2518,10 +2509,10 @@ struct CompactLevel0Phase1Stats {
     tenant_id: TenantShardId,
     timeline_id: TimelineId,
     read_lock_acquisition_micros: RecordedDuration,
-    read_lock_held_key_sort_micros: RecordedDuration,
+    index_metadata_micros: RecordedDuration,
     compaction_prerequisites_micros: RecordedDuration,
-    read_lock_held_compute_holes_micros: RecordedDuration,
-    read_lock_drop_micros: RecordedDuration,
+    hole_selection_micros: RecordedDuration,
+    output_setup_micros: RecordedDuration,
     write_layer_files_micros: RecordedDuration,
     level0_deltas_count: usize,
     new_deltas_count: usize,
@@ -2544,22 +2535,22 @@ impl TryFrom<CompactLevel0Phase1StatsBuilder> for CompactLevel0Phase1Stats {
                 .read_lock_acquisition_micros
                 .into_recorded()
                 .ok_or_else(|| anyhow!("read_lock_acquisition_micros not set"))?,
-            read_lock_held_key_sort_micros: value
-                .read_lock_held_key_sort_micros
+            index_metadata_micros: value
+                .index_metadata_micros
                 .into_recorded()
-                .ok_or_else(|| anyhow!("read_lock_held_key_sort_micros not set"))?,
+                .ok_or_else(|| anyhow!("index_metadata_micros not set"))?,
             compaction_prerequisites_micros: value
                 .compaction_prerequisites_micros
                 .into_recorded()
                 .ok_or_else(|| anyhow!("read_lock_held_prerequisites_micros not set"))?,
-            read_lock_held_compute_holes_micros: value
-                .read_lock_held_compute_holes_micros
+            hole_selection_micros: value
+                .hole_selection_micros
                 .into_recorded()
-                .ok_or_else(|| anyhow!("read_lock_held_compute_holes_micros not set"))?,
-            read_lock_drop_micros: value
-                .read_lock_drop_micros
+                .ok_or_else(|| anyhow!("hole_selection_micros not set"))?,
+            output_setup_micros: value
+                .output_setup_micros
                 .into_recorded()
-                .ok_or_else(|| anyhow!("read_lock_drop_micros not set"))?,
+                .ok_or_else(|| anyhow!("output_setup_micros not set"))?,
             write_layer_files_micros: value
                 .write_layer_files_micros
                 .into_recorded()

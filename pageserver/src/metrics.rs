@@ -103,16 +103,16 @@ pub(crate) static STORAGE_TIME_COUNT_PER_TIMELINE: Lazy<IntCounterVec> = Lazy::n
     .expect("failed to define a metric")
 });
 
-/// Values reported by the latest completed legacy L0 compaction phase 1 for a timeline.
+/// Values reported by the latest completed legacy L0 compaction phase 1.
 ///
-/// This is intentionally a gauge: a phase-1 batch has one authoritative value for each
-/// stat, and replacing that value lets integration tests and operators inspect the batch
-/// without reconstructing it from logs or layer files.
+/// The fixed `stat` label keeps this diagnostic bounded while exposing the native
+/// phase-1 authority needed by integration tests without reconstructing data from
+/// logs or on-disk layer files.
 pub(crate) static L0_COMPACTION_PHASE1_LAST: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge_vec!(
         "pageserver_l0_compaction_phase1_last",
-        "Selected input and completed phase-1 work for the latest legacy L0 compaction",
-        &["stat", "tenant_id", "shard_id", "timeline_id"],
+        "Selected input and pre-write metadata work for the latest legacy L0 compaction",
+        &["stat"],
     )
     .expect("failed to define a metric")
 });
