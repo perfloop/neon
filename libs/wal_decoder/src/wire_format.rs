@@ -357,6 +357,88 @@ impl From<proto::CompactKey> for CompactKey {
     }
 }
 
+#[tokio::test]
+async fn test_wire_roundtrip_preserves_serialized_batch() {
+    use pageserver_api::key::Key;
+
+    fn records() -> InterpretedWalRecords {
+        let mut first_key = Key::from_i128(0);
+        first_key.field6 = 1;
+        let mut observed_key = Key::from_i128(0);
+        observed_key.field6 = 2;
+        let mut second_key = Key::from_i128(0);
+        second_key.field6 = 3;
+
+        InterpretedWalRecords {
+            records: vec![InterpretedWalRecord {
+                metadata_record: None,
+                batch: SerializedValueBatch {
+                    raw: [vec![0xA1; 12], vec![0xB2; 16]].concat(),
+                    metadata: vec![
+                        ValueMeta::Serialized(SerializedValueMeta {
+                            key: first_key.to_compact(),
+                            lsn: Lsn(0x10),
+                            batch_offset: 0,
+                            len: 12,
+                            will_init: true,
+                        }),
+                        ValueMeta::Observed(ObservedValueMeta {
+                            key: observed_key.to_compact(),
+                            lsn: Lsn(0x11),
+                        }),
+                        ValueMeta::Serialized(SerializedValueMeta {
+                            key: second_key.to_compact(),
+                            lsn: Lsn(0x12),
+                            batch_offset: 12,
+                            len: 16,
+                            will_init: false,
+                        }),
+                    ],
+                    max_lsn: Lsn(0x12),
+                    len: 2,
+                },
+                next_record_lsn: Lsn(0x20),
+                flush_uncommitted: FlushUncommittedRecords::No,
+                xid: 42,
+            }],
+            next_record_lsn: Lsn(0x20),
+            raw_wal_start_lsn: Some(Lsn(0x10)),
+        }
+    }
+
+    for format in [InterpretedFormat::Bincode, InterpretedFormat::Protobuf] {
+        let encoded = records().to_wire(format, None).await.unwrap();
+        let decoded = InterpretedWalRecords::from_wire(&encoded, format, None)
+            .await
+            .unwrap();
+        let batch = &decoded.records[0].batch;
+
+        assert_eq!(batch.raw, [vec![0xA1; 12], vec![0xB2; 16]].concat());
+        assert_eq!(batch.len, 2);
+        assert_eq!(batch.max_lsn, Lsn(0x12));
+        assert_eq!(batch.metadata.len(), 3);
+
+        let ValueMeta::Serialized(first) = &batch.metadata[0] else {
+            panic!("expected a serialized first value");
+        };
+        assert_eq!(first.batch_offset, 0);
+        assert_eq!(first.len, 12);
+        assert!(first.will_init);
+
+        let ValueMeta::Observed(observed) = &batch.metadata[1] else {
+            panic!("expected an observed middle value");
+        };
+        assert_eq!(observed.lsn, Lsn(0x11));
+
+        let ValueMeta::Serialized(second) = &batch.metadata[2] else {
+            panic!("expected a serialized second value");
+        };
+        assert_eq!(second.batch_offset, 12);
+        assert_eq!(second.len, 16);
+        assert!(!second.will_init);
+    }
+}
+
 #[test]
 fn test_compact_key_with_large_relnode() {
     use pageserver_api::key::Key;

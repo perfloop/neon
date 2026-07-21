@@ -922,4 +922,100 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_put_batch_after_extension_keeps_bytes_and_offsets() {
+        use bytes::Bytes;
+        use utils::bin_ser::BeSer;
+        use utils::id::TenantId;
+        use wal_decoder::models::value::Value;
+
+        use crate::context::DownloadBehavior;
+        use crate::task_mgr::TaskKind;
+        use crate::virtual_file::{self, IoMode};
+
+        // Direct I/O is neither relevant to index offsets nor reliably available on
+        // every test filesystem. This test exercises the buffered write path.
+        virtual_file::set_io_mode(IoMode::Buffered);
+
+        let repo_dir =
+            PageServerConf::test_repo_dir("test_put_batch_after_extension_keeps_bytes_and_offsets");
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        let conf: &'static PageServerConf =
+            Box::leak(Box::new(PageServerConf::dummy_conf(repo_dir)));
+        let tenant_shard_id = TenantShardId::unsharded(TenantId::generate());
+        let timeline_id = TimelineId::generate();
+        tokio::fs::create_dir_all(conf.timeline_path(&tenant_shard_id, &timeline_id))
+            .await
+            .unwrap();
+
+        let ctx =
+            RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error).with_scope_unit_test();
+        let gate = utils::sync::gate::Gate::default();
+        let cancel = CancellationToken::new();
+        let layer = InMemoryLayer::create(
+            conf,
+            timeline_id,
+            tenant_shard_id,
+            Lsn(0x10),
+            &gate,
+            &cancel,
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let values = (0..3)
+            .map(|record| {
+                let mut key = Key::from_i128(0);
+                key.field6 = record;
+                let value = Value::Image(Bytes::from(vec![record as u8 + 1; 8 * 1024]));
+                let serialized_size = value.serialized_size().unwrap() as usize;
+                (
+                    key.to_compact(),
+                    Lsn(0x10 + record as u64),
+                    serialized_size,
+                    value,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut expected_bytes = Vec::new();
+        for (_, _, _, value) in &values {
+            value.ser_into(&mut expected_bytes).unwrap();
+        }
+
+        let mut batches = values
+            .clone()
+            .into_iter()
+            .map(|value| SerializedValueBatch::from_values(vec![value]));
+        let mut batch = batches.next().unwrap();
+        for next in batches {
+            batch.extend(next);
+        }
+        layer.put_batch(batch, &ctx).await.unwrap();
+
+        let index = layer.index.read().await;
+        let mut expected_offset = 0u64;
+        for (key, lsn, serialized_size, value) in &values {
+            let entries = index.get(key).unwrap().as_slice();
+            assert_eq!(entries.len(), 1);
+            let (entry_lsn, entry) = entries[0];
+            assert_eq!(entry_lsn, *lsn);
+
+            let entry = entry.unpack();
+            assert_eq!(entry.pos, expected_offset);
+            assert_eq!(entry.len, *serialized_size as u64);
+            assert_eq!(entry.will_init, value.will_init());
+            expected_offset += *serialized_size as u64;
+        }
+        drop(index);
+
+        let written = layer.file.load_to_io_buf(&ctx).await.unwrap();
+        assert_eq!(&written[..], expected_bytes.as_slice());
+        assert_eq!(layer.file.len() as usize, expected_bytes.len());
+
+        drop(layer);
+        gate.close().await;
+    }
 }
