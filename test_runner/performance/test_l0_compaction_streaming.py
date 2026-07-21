@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from fixtures.benchmark_fixture import MetricReport
+from fixtures.common_types import Lsn
 from fixtures.neon_fixtures import wait_for_last_flush_lsn
 from fixtures.utils import skip_in_debug_build
 
@@ -103,17 +104,37 @@ def _compact_l0s(pageserver_http, tenant_id, timeline_id) -> None:
     pageserver_http.timeline_compact(tenant_id, timeline_id, force_l0_compaction=True)
 
 
-def _assert_new_delta_descriptors(before_layers, after_layers, minimum: int = 1) -> None:
+def _new_delta_descriptors(before_layers, after_layers):
     before_names = before_layers.historic_by_name()
-    new_deltas = [
+    return [
         layer
         for layer in after_layers.delta_layers()
         if not layer.l0 and layer.layer_file_name not in before_names
     ]
+
+
+def _assert_new_delta_descriptors(before_layers, after_layers, minimum: int = 1):
+    new_deltas = _new_delta_descriptors(before_layers, after_layers)
     assert len(new_deltas) >= minimum
     assert all(
         layer.lsn_end is not None and layer.lsn_start != layer.lsn_end for layer in new_deltas
     )
+    return new_deltas
+
+
+def _assert_duplicate_lsn_output_descriptors(before_layers, new_deltas) -> None:
+    """Check the public L1 descriptors actually contain LSN-sliced output."""
+    input_l0s = before_layers.delta_l0_layers()
+    assert input_l0s
+    input_ranges = [(Lsn(layer.lsn_start), Lsn(layer.lsn_end)) for layer in input_l0s]
+    output_ranges = [(Lsn(layer.lsn_start), Lsn(layer.lsn_end)) for layer in new_deltas]
+
+    input_start = min(start for start, _ in input_ranges)
+    input_end = max(end for _, end in input_ranges)
+    # Key-only partitions retain the whole selected LSN range. At least one
+    # output must have a strict subrange when a repeated key is LSN-split.
+    assert len(set(output_ranges)) > 1
+    assert any(start > input_start or end < input_end for start, end in output_ranges)
 
 
 def _benchmark_int_env(name: str, default: int) -> int:
@@ -191,7 +212,9 @@ def test_l0_compaction_streaming(neon_env_builder: NeonEnvBuilder, zenbenchmark)
         _compact_l0s(pageserver_http, tenant_id, timeline_id)
     rss_after_kib = pageserver_http.get_metric_value("libmetrics_maxrss_kb")
     assert rss_after_kib is not None
-    assert rss_after_kib >= rss_before_kib
+    # A zero delta would make a peak-RSS comparison uninformative: the measured
+    # phase must exceed the restart-scoped pre-compaction high-water mark.
+    assert rss_after_kib > rss_before_kib
 
     selected_entries = _l0_stat(pageserver_http, tenant_id, timeline_id, "selected_entries")
     selected_layers = _l0_stat(pageserver_http, tenant_id, timeline_id, "selected_l0_layers")
@@ -304,6 +327,10 @@ def test_l0_compaction_duplicate_lsn_splits(neon_env_builder: NeonEnvBuilder):
         "gc_period": "0s",
         "compaction_period": "0s",
         "checkpoint_distance": 32 * 1024,
+        # The default L1 target is 128 MiB, which would never split this
+        # deliberately small repeated-key stack. Keep the target below one
+        # page image so the public compaction request must create LSN slices.
+        "compaction_target_size": 8 * 1024,
         "compaction_threshold": update_rounds,
         "compaction_upper_limit": update_rounds,
         "image_creation_threshold": 100000,
@@ -346,7 +373,8 @@ def test_l0_compaction_duplicate_lsn_splits(neon_env_builder: NeonEnvBuilder):
     assert _l0_stat(pageserver_http, tenant_id, timeline_id, "duplicate_lsn_splits") > 0
     after_layers = pageserver_http.layer_map_info(tenant_id, timeline_id)
     assert not after_layers.delta_l0_layers()
-    _assert_new_delta_descriptors(before_layers, after_layers, minimum=2)
+    new_deltas = _assert_new_delta_descriptors(before_layers, after_layers, minimum=2)
+    _assert_duplicate_lsn_output_descriptors(before_layers, new_deltas)
 
     endpoint.start()
     assert _table_rows(endpoint, ["duplicate_key"]) == expected_rows
