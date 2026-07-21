@@ -4,6 +4,8 @@
 mod auth;
 pub mod basebackup;
 pub mod basebackup_cache;
+#[cfg(feature = "benchmarking")]
+pub mod benchmarking;
 pub mod config;
 pub mod consumption_metrics;
 pub mod context;

@@ -18,6 +18,8 @@ where
         // SAFETY: we own `slice`, don't write outside the bounds
         unsafe {
             let to_init = self.bytes_total() - self.bytes_init();
+            #[cfg(feature = "benchmarking")]
+            crate::benchmarking::record_zeroed_write_bytes(to_init);
             self.stable_mut_ptr()
                 .add(self.bytes_init())
                 .write_bytes(0, to_init);

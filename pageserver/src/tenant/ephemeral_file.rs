@@ -178,6 +178,9 @@ impl EphemeralFile {
         &self,
         ctx: &RequestContext,
     ) -> Result<IoBufferMut, io::Error> {
+        #[cfg(feature = "benchmarking")]
+        let benchmark_timer = crate::benchmarking::LoadTimer::start();
+
         let size = self.len().into_usize();
         let buf = IoBufferMut::with_capacity(size);
         let (slice, nread) = self.read_exact_at_eof_ok(0, buf.slice_full(), ctx).await?;
@@ -185,6 +188,8 @@ impl EphemeralFile {
         let buf = slice.into_inner();
         assert_eq!(buf.len(), nread);
         assert_eq!(buf.capacity(), size, "we shouldn't be reallocating");
+        #[cfg(feature = "benchmarking")]
+        benchmark_timer.finish(size);
         Ok(buf)
     }
 
@@ -590,6 +595,81 @@ mod tests {
             &writer.mutable()[0..cap / 2],
             &content[cap * 2..cap * 2 + cap / 2]
         );
+    }
+
+    async fn assert_snapshot_and_zeroed_eof_tail(
+        file: &EphemeralFile,
+        content: &[u8],
+        align: usize,
+        ctx: &RequestContext,
+    ) {
+        let snapshot = file.load_to_io_buf(ctx).await.unwrap();
+        assert_eq!(&snapshot[..], content);
+
+        let short_start = content.len() - align;
+        let requested_len = 2 * align;
+        let (short_slice, nread) = file
+            .read_exact_at_eof_ok(
+                short_start.into_u64(),
+                IoBufferMut::with_capacity(requested_len).slice_full(),
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(nread, align);
+        let short = short_slice.into_inner();
+        assert_eq!(&short[..nread], &content[short_start..]);
+        assert!(
+            short[nread..].iter().all(|byte| *byte == 0),
+            "the generic EOF-tolerant fallback must leave its unread tail zeroed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_to_io_buf_snapshot_tail_states_and_disk_error() {
+        let (conf, tenant_id, timeline_id, ctx) =
+            harness("test_load_to_io_buf_snapshot_tail_states_and_disk_error").unwrap();
+        let gate = utils::sync::gate::Gate::default();
+        let cancel = CancellationToken::new();
+        let file = EphemeralFile::create(conf, tenant_id, timeline_id, &gate, &cancel, &ctx)
+            .await
+            .unwrap();
+
+        let cap = file.buffered_writer.read().await.mutable().capacity();
+        let align = file.buffered_writer.read().await.mutable().align();
+        let content: Vec<u8> = rand::rng()
+            .sample_iter(rand::distr::StandardUniform)
+            .take(cap * 2 + cap / 2)
+            .collect();
+
+        let (_, control) = file.write_raw_controlled(&content, &ctx).await.unwrap();
+        let control = control.expect("the test writes enough data to submit a flush");
+
+        // The controlled flush has not started: the snapshot combines a disk
+        // prefix with both writer-tail sources.
+        assert_snapshot_and_zeroed_eof_tail(&file, &content, align, &ctx).await;
+
+        let in_progress = control.into_not_started().ready_to_flush();
+        // The same logical bytes must remain available while a writer flush is
+        // running.
+        assert_snapshot_and_zeroed_eof_tail(&file, &content, align, &ctx).await;
+
+        in_progress.wait_until_flush_is_done().await;
+        // Once the writer flush completes, the disk-backed prefix is still
+        // combined with the retained writer tail correctly.
+        assert_snapshot_and_zeroed_eof_tail(&file, &content, align, &ctx).await;
+
+        // Corrupt the disk-only prefix while leaving the in-memory tails
+        // intact. A full snapshot must surface the short physical read rather
+        // than return partly initialized data.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(file.file.path())
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let err = file.load_to_io_buf(&ctx).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]
