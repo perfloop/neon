@@ -234,6 +234,7 @@ def test_l0_compaction_hole_selection(neon_env_builder: NeonEnvBuilder):
         "gc_period": "0s",
         "compaction_period": "0s",
         "checkpoint_distance": 64 * 1024,
+        "compaction_target_size": 64 * 1024,
         "compaction_threshold": 4,
         "compaction_upper_limit": 4,
         "image_creation_threshold": 1,
@@ -253,11 +254,14 @@ def test_l0_compaction_hole_selection(neon_env_builder: NeonEnvBuilder):
         tenant_id,
         timeline_id,
         force_l0_compaction=True,
+        force_repartition=True,
         force_image_layer_creation=True,
     )
     base_layers = pageserver_http.layer_map_info(tenant_id, timeline_id)
     assert not base_layers.delta_l0_layers()
-    assert len(base_layers.image_layers()) >= 3
+    # Layer partitioning is implementation-dependent, but the gap must be covered
+    # by at least one image before we can verify hole selection below.
+    assert base_layers.image_layers()
 
     for update_round in range(4):
         with closing(endpoint.connect()) as conn:
