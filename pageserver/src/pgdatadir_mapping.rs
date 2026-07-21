@@ -223,6 +223,8 @@ impl Timeline {
             pending_lsns: Vec::new(),
             pending_metadata_pages: HashMap::new(),
             pending_data_batch: None,
+            #[cfg(test)]
+            ingest_batch_copy_bytes: 0,
             pending_deletions: Vec::new(),
             pending_nblocks: 0,
             pending_directory_entries: Vec::new(),
@@ -241,6 +243,8 @@ impl Timeline {
             pending_lsns: Vec::new(),
             pending_metadata_pages: HashMap::new(),
             pending_data_batch: None,
+            #[cfg(test)]
+            ingest_batch_copy_bytes: 0,
             pending_deletions: Vec::new(),
             pending_nblocks: 0,
             pending_directory_entries: Vec::new(),
@@ -1697,6 +1701,12 @@ pub struct DatadirModification<'a> {
     /// which keys are stored here.
     pending_data_batch: Option<SerializedValueBatch>,
 
+    /// Bytes copied from an incoming decoded WAL batch into an already accumulated contiguous
+    /// batch. This is a test-only, per-modification mechanism probe for the ingest merge; it
+    /// deliberately excludes the buffered writer's necessary final copy.
+    #[cfg(test)]
+    ingest_batch_copy_bytes: usize,
+
     /// For special "directory" keys that store key-value maps, track the size of the map
     /// if it was updated in this modification.
     pending_directory_entries: Vec<(DirectoryKind, MetricsUpdate)>,
@@ -1742,6 +1752,13 @@ impl DatadirModification<'_> {
             .as_ref()
             .map_or(0, |b| b.buffer_size())
             + self.pending_metadata_bytes
+    }
+
+    /// The bytes copied at this modification's decoded-WAL merge boundary. This test-only
+    /// accounting is intentionally local to the owner of the merge, not a process-global counter.
+    #[cfg(test)]
+    pub(crate) fn ingest_batch_copy_bytes(&self) -> usize {
+        self.ingest_batch_copy_bytes
     }
 
     pub(crate) fn has_dirty_data(&self) -> bool {
@@ -1958,6 +1975,13 @@ impl DatadirModification<'_> {
 
         match self.pending_data_batch.as_mut() {
             Some(pending_batch) => {
+                #[cfg(test)]
+                {
+                    // Vec::extend materializes this decoded record in the already accumulated
+                    // contiguous batch. Keep the accounting at this owner-local merge boundary;
+                    // do not count EphemeralFile's separate, required buffered write.
+                    self.ingest_batch_copy_bytes += batch.buffer_size();
+                }
                 pending_batch.extend(batch);
             }
             None if batch.has_data() => {

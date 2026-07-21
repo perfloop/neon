@@ -2439,3 +2439,7 @@ mod tests {
         println!("done in {duration:?}");
     }
 }
+
+#[cfg(test)]
+#[path = "walingest_perf.rs"]
+mod wal_ingest_perf;
