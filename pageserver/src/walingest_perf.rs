@@ -5,7 +5,6 @@
 //! real WAL ingest/commit path without freezing or renaming the in-memory layer.
 
 use std::collections::HashMap;
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 use async_compression::tokio::bufread::ZstdDecoder;
@@ -183,7 +182,6 @@ async fn wal_ingest_merge_perf() -> Result<()> {
         .await?;
     let mut modification = tline.begin_modification(Lsn(0));
 
-    let started_at = Instant::now();
     let mut used_records = 0usize;
     let mut data_records = 0usize;
     let mut last_record_lsn = None;
@@ -214,7 +212,6 @@ async fn wal_ingest_merge_perf() -> Result<()> {
     let pending_bytes = modification.approx_pending_bytes();
     let intermediate_copy_bytes = modification.ingest_batch_copy_bytes();
     modification.commit(&ctx).await?;
-    let elapsed = started_at.elapsed();
 
     anyhow::ensure!(
         pending_bytes > DatadirModification::MAX_PENDING_BYTES,
@@ -266,7 +263,6 @@ async fn wal_ingest_merge_perf() -> Result<()> {
     assert!(old_image.lsn < new_image.lsn);
 
     if std::env::var_os("PERFLOOP_PROOF").is_some() {
-        emit_proof("merge_write_ns/op", elapsed.as_nanos());
         // This is the source-batch-to-contiguous-aggregate copy only. The writer's final copy is
         // intentionally not included because it remains necessary for the on-disk representation.
         emit_proof("merge_intermediate_copy_bytes/op", intermediate_copy_bytes);
