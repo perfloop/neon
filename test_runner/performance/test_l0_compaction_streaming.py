@@ -180,7 +180,10 @@ def _assert_hole_fixture_has_image_coverage(base_layers) -> None:
     ]
     assert all(isinstance(layer, ImageLayerName) for layer in image_layers)
     covered = [
-        layer for layer in image_layers if layer.key_start < HOLE_END and layer.key_end > HOLE_START
+        layer
+        for layer in image_layers
+        if layer.key_start.as_int() < HOLE_END.as_int()
+        and layer.key_end.as_int() > HOLE_START.as_int()
     ]
     # Legacy selects only holes that have enough image coverage to make avoiding
     # an L1 over the gap meaningful. This fixture deliberately supplies more than
