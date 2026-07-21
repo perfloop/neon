@@ -399,7 +399,7 @@ fn emit(metric: &str, value: u64) {
 
 fn main() -> Result<()> {
     let config = parse_config()?;
-    let temp_dir = camino_tempfile::tempdir_in(std::env::current_dir()?)?;
+    let temp_dir = camino_tempfile::tempdir_in(Utf8Path::new("."))?;
     let conf: &'static PageServerConf = Box::leak(Box::new(PageServerConf::dummy_conf(
         temp_dir.path().to_path_buf(),
     )));
