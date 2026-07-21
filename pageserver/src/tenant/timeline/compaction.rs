@@ -45,6 +45,7 @@ use wal_decoder::models::record::NeonWalRecord;
 use wal_decoder::models::value::Value;
 
 use crate::context::{AccessStatsBehavior, RequestContext, RequestContextBuilder};
+use crate::metrics;
 use crate::page_cache;
 use crate::statvfs::Statvfs;
 use crate::tenant::checks::check_valid_layermap;
@@ -2041,6 +2042,7 @@ impl Timeline {
         stats.compaction_prerequisites_micros = stats.read_lock_acquisition_micros.till_now();
 
         // TODO: replace with streaming k-merge
+        let index_metadata_started = tokio::time::Instant::now();
         let all_keys = {
             let mut all_keys = Vec::new();
             for l in deltas_to_compact.iter() {
@@ -2059,6 +2061,11 @@ impl Timeline {
             all_keys.sort_by_key(|DeltaEntry { key, lsn, .. }| (*key, *lsn));
             all_keys
         };
+        let index_metadata_micros = u64::try_from(index_metadata_started.elapsed().as_micros())
+            .expect("index metadata duration fits in u64 microseconds");
+        let selected_entries = u64::try_from(all_keys.len()).expect("entry count fits in u64");
+        let selected_l0_layers =
+            u64::try_from(deltas_to_compact.len()).expect("selected layer count fits in u64");
 
         stats.read_lock_held_key_sort_micros = stats.compaction_prerequisites_micros.till_now();
 
@@ -2135,6 +2142,7 @@ impl Timeline {
             holes.sort_unstable_by_key(|hole| hole.key_range.start);
             holes
         };
+        let selected_holes = u64::try_from(holes.len()).expect("hole count fits in u64");
         stats.read_lock_held_compute_holes_micros = stats.read_lock_held_key_sort_micros.till_now();
 
         if self.cancel.is_cancelled() {
@@ -2232,6 +2240,7 @@ impl Timeline {
         let mut dup_start_lsn: Lsn = Lsn::INVALID; // start LSN of layer containing values of the single key
         let mut dup_end_lsn: Lsn = Lsn::INVALID; // end LSN of layer containing values of the single key
         let mut next_hole = 0; // index of next hole in holes vector
+        let mut duplicate_lsn_splits = 0u64;
 
         let mut keys = 0;
 
@@ -2281,6 +2290,7 @@ impl Timeline {
                             lsn // start with the first LSN for this key
                         };
                         dup_end_lsn = next_lsn; // upper LSN boundary is exclusive
+                        duplicate_lsn_splits += 1;
                         break;
                     }
                 }
@@ -2427,6 +2437,22 @@ impl Timeline {
         stats.write_layer_files_micros = stats.read_lock_drop_micros.till_now();
         stats.new_deltas_count = Some(new_layers.len());
         stats.new_deltas_size = Some(new_layers.iter().map(|l| l.layer_desc().file_size).sum());
+
+        let tenant_id = self.tenant_shard_id.tenant_id.to_string();
+        let shard_id = self.tenant_shard_id.shard_slug().to_string();
+        let timeline_id = self.timeline_id.to_string();
+        for (stat, value) in [
+            ("index_metadata_micros", index_metadata_micros),
+            ("selected_entries", selected_entries),
+            ("selected_l0_layers", selected_l0_layers),
+            ("selected_holes", selected_holes),
+            ("duplicate_lsn_splits", duplicate_lsn_splits),
+        ] {
+            metrics::L0_COMPACTION_PHASE1_LAST
+                .get_metric_with_label_values(&[stat, &tenant_id, &shard_id, &timeline_id])
+                .expect("fixed L0 compaction metric labels")
+                .set(i64::try_from(value).expect("L0 compaction stat fits in i64"));
+        }
 
         match TryInto::<CompactLevel0Phase1Stats>::try_into(stats)
             .and_then(|stats| serde_json::to_string(&stats).context("serde_json::to_string"))
