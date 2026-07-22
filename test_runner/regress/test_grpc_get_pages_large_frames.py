@@ -143,6 +143,15 @@ def test_grpc_get_pages_large_frames(
         assert timer_starts >= frame_size
         assert vectored_calls >= 1
 
+        # A one-message frame is an unambiguous direct server completion: the helper has no
+        # alternative one-message path, and its only fallback appends all in-cap chunks.
+        # This keeps the request-message metric from treating a masked oversized response as a
+        # successful direct frame.
+        if result["grpc_request_messages"] == 1:
+            assert result["oversized_fallbacks"] == 0
+        if result["oversized_fallbacks"] == 0:
+            assert result["grpc_request_messages"] == 1
+
         # Each line is a single native-integration-test sample. The Perfloop controller repeats
         # this test invocation and compares the server-attributed counters across revisions.
         print(
@@ -195,7 +204,7 @@ def test_grpc_get_pages_large_frames(
         )
         print(
             f"verified_grpc_get_pages_frame size={frame_size} pages={result['returned_pages']} "
-            "order=preserved"
+            f"order=preserved oversized_fallbacks={result['oversized_fallbacks']}"
         )
         log.info(
             "verified gRPC GetPages frame size=%s timer_starts=%s vectored_calls=%s "
