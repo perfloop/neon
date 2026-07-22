@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import pytest
 from fixtures.log_helper import log
 from fixtures.neon_fixtures import wait_for_last_flush_lsn
 
@@ -72,7 +71,6 @@ def run_get_pages_frame(
     return {key: int(value) for key, value in result.items()}
 
 
-@pytest.mark.timeout(120)
 def test_grpc_get_pages_large_frames(
     neon_env_builder: NeonEnvBuilder,
     neon_binpath: Path,
