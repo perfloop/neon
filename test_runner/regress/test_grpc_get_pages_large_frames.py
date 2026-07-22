@@ -143,13 +143,13 @@ def test_grpc_get_pages_large_frames(
         assert timer_starts >= frame_size
         assert vectored_calls >= 1
 
-        # A one-message frame is an unambiguous direct server completion: the helper has no
-        # alternative one-message path, and its only fallback appends all in-cap chunks.
-        # This keeps the request-message metric from treating a masked oversized response as a
-        # successful direct frame.
-        if result["grpc_request_messages"] == 1:
+        # The legacy path starts one timer for the rejected over-cap frame and one more for its
+        # validated fallback chunks: two starts per requested page. Any material reduction below
+        # that legacy shape must therefore be a direct response, not an early rejection that lets
+        # this helper mask the failure by retrying. A one-message frame is unambiguous because the
+        # helper's only fallback appends all in-cap chunks.
+        if timer_starts < 2 * frame_size:
             assert result["oversized_fallbacks"] == 0
-        if result["oversized_fallbacks"] == 0:
             assert result["grpc_request_messages"] == 1
 
         # Each line is a single native-integration-test sample. The Perfloop controller repeats
