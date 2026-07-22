@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 
 FRAME_SIZES_ENV = "PERFLOOP_GRPC_GET_PAGE_FRAME_SIZES"
+BENCH_BIN_ENV = "PERFLOOP_BENCH_BIN"
 SMGR_STARTED_METRIC = "pageserver_smgr_query_started_count_total"
 GET_VECTORED_COUNT_METRIC = "pageserver_get_vectored_seconds_count"
 
@@ -41,8 +42,12 @@ def run_get_pages_frame(
     frame_size: int,
 ) -> dict[str, int]:
     dbnode, spcnode, relnode = relation
+    frame_bench = Path(
+        os.environ.get(BENCH_BIN_ENV, str(neon_binpath / "perfloop_get_pages_frame"))
+    )
+    assert frame_bench.is_file(), f"GetPages frame benchmark not found at {frame_bench}"
     command = [
-        str(neon_binpath / "perfloop_get_pages_frame"),
+        str(frame_bench),
         "--endpoint",
         f"http://localhost:{env.pageserver.service_port.grpc}",
         "--tenant-id",
