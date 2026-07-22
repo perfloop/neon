@@ -109,9 +109,13 @@ def test_grpc_get_pages_large_frames(
         env.initial_timeline,
     )
 
-    # The unfixed server emits this expected per-request error before the helper retries with
-    # in-limit frames. The helper only accepts this precise error and verifies every returned page.
-    env.pageserver.allowed_errors.append(r".*batching oversized.*")
+    # An over-cap request reaches get_vectored only after the per-page setup. Its internal
+    # `batching oversized` diagnostic is intentionally flattened to this exact public gRPC error.
+    # The helper accepts it only for an over-cap frame, retries in-limit chunks, and validates every
+    # returned page; any error from an in-limit chunk still fails the test.
+    env.pageserver.allowed_errors.append(
+        r".*grpc:pageservice.*request failed with Internal: Read error.*"
+    )
     smgr_filters = {
         "smgr_query_type": "get_page_at_lsn",
         "tenant_id": str(env.initial_tenant),

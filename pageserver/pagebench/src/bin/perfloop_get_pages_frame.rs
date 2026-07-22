@@ -137,7 +137,13 @@ async fn main() -> anyhow::Result<()> {
 
         if response.status_code != page_api::GetPageStatusCode::Ok {
             let reason = response.reason.unwrap_or_default();
-            if reason.contains("batching oversized")
+            // The server maps GetVectoredError::Oversized through PageReconstructError and then
+            // PageStreamError, so the gRPC protocol deliberately exposes only this stable public
+            // shape rather than the inner `batching oversized` diagnostic. Accept it only for an
+            // over-cap frame; every fallback is then an in-limit request whose pages are validated
+            // below. A different failure, or the same error for an in-limit frame, remains fatal.
+            if response.status_code == page_api::GetPageStatusCode::InternalError
+                && reason == "Read error"
                 && block_numbers.len() > args.fallback_chunk_size
             {
                 oversized_fallbacks += 1;
