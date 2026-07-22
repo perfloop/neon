@@ -3602,7 +3602,9 @@ impl GrpcPageServiceHandler {
             pages: Vec::with_capacity(req.block_numbers.len()),
         };
 
-        for block_numbers in req.block_numbers.chunks(max_get_vectored_keys) {
+        for (chunk_index, block_numbers) in
+            req.block_numbers.chunks(max_get_vectored_keys).enumerate()
+        {
             let mut batch = SmallVec::with_capacity(block_numbers.len());
             for &blkno in block_numbers {
                 // TODO: this creates one timer per page and throttles it. We should have a timer for
@@ -3658,6 +3660,14 @@ impl GrpcPageServiceHandler {
                     }
                     Err(err) => return Err(err.err.into()),
                 };
+            }
+
+            // Lets the gRPC integration test exercise an error after earlier
+            // internal chunks have succeeded, without exposing a partial prefix.
+            if chunk_index + 1 == MAX_GET_PAGE_FRAME_CHUNKS {
+                fail::fail_point!("ps::grpc-get-pages-final-chunk", |_| Err(
+                    tonic::Status::internal("injected final internal GetPages batch error")
+                ));
             }
         }
 
