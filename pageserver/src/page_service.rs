@@ -3508,6 +3508,24 @@ impl GrpcPageServiceHandler {
         }
     }
 
+    fn max_get_page_frame_blocks(max_get_vectored_keys: usize) -> usize {
+        max_get_vectored_keys.saturating_mul(MAX_GET_PAGE_FRAME_CHUNKS)
+    }
+
+    fn validate_get_page_frame_size(
+        req: &page_api::GetPageRequest,
+        max_get_vectored_keys: usize,
+    ) -> Result<(), tonic::Status> {
+        let max_frame_blocks = Self::max_get_page_frame_blocks(max_get_vectored_keys);
+        if req.block_numbers.len() > max_frame_blocks {
+            return Err(tonic::Status::invalid_argument(format!(
+                "GetPages request has {} blocks, limit is {max_frame_blocks}",
+                req.block_numbers.len(),
+            )));
+        }
+        Ok(())
+    }
+
     /// Starts a SmgrOpTimer at received_at, throttles the request, and records execution start.
     /// Only errors if the timeline is shutting down.
     ///
@@ -3548,13 +3566,7 @@ impl GrpcPageServiceHandler {
         received_at: Instant,
     ) -> Result<page_api::GetPageResponse, tonic::Status> {
         let max_get_vectored_keys = timeline.conf.max_get_vectored_keys.get();
-        let max_frame_blocks = max_get_vectored_keys.saturating_mul(MAX_GET_PAGE_FRAME_CHUNKS);
-        if req.block_numbers.len() > max_frame_blocks {
-            return Err(tonic::Status::invalid_argument(format!(
-                "GetPages request has {} blocks, limit is {max_frame_blocks}",
-                req.block_numbers.len(),
-            )));
-        }
+        Self::validate_get_page_frame_size(&req, max_get_vectored_keys)?;
 
         let ctx = ctx.with_scope_page_service_pagestream(&timeline);
 
@@ -3695,6 +3707,12 @@ impl GrpcPageServiceHandler {
         if shard_id.count <= parent.shard_count {
             return Err(HandleUpgradeError::ShutDown.into()); // emulate original error
         }
+
+        // Bound the original wire frame before GetPageSplitter can allocate a
+        // response slot or per-child request for every supplied block. The child
+        // requests below are each validated again by get_page(), but their limits
+        // must not turn this aggregate admission bound into a per-child bound.
+        Self::validate_get_page_frame_size(&req, timeline.conf.max_get_vectored_keys.get())?;
 
         // Fast path: the request fits in a single shard.
         if let Some(shard_index) =
