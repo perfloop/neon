@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 
 FRAME_SIZES_ENV = "PERFLOOP_GRPC_GET_PAGE_FRAME_SIZES"
+FRAME_REPETITIONS_ENV = "PERFLOOP_GRPC_GET_PAGE_FRAME_REPETITIONS"
 BENCH_BIN_ENV = "PERFLOOP_BENCH_BIN"
 SMGR_STARTED_METRIC = "pageserver_smgr_query_started_count_total"
 GET_VECTORED_COUNT_METRIC = "pageserver_get_vectored_seconds_count"
@@ -25,6 +26,12 @@ def frame_sizes() -> list[int]:
     assert sizes, f"{FRAME_SIZES_ENV} must name at least one frame size"
     assert all(size > 0 for size in sizes), f"{FRAME_SIZES_ENV} must contain only positive sizes"
     return sizes
+
+
+def frame_repetitions() -> int:
+    repetitions = int(os.environ.get(FRAME_REPETITIONS_ENV, "32"))
+    assert repetitions > 0, f"{FRAME_REPETITIONS_ENV} must be positive"
+    return repetitions
 
 
 def metric_value(metric_name: str, filters: dict[str, str], env: NeonEnv) -> float:
@@ -77,6 +84,7 @@ def test_grpc_get_pages_large_frames(
     pg_bin: PgBin,
 ):
     sizes = frame_sizes()
+    repetitions = frame_repetitions()
     env = neon_env_builder.init_start()
     endpoint = env.endpoints.create_start("main")
 
@@ -123,9 +131,10 @@ def test_grpc_get_pages_large_frames(
     relation = (int(dbnode), int(spcnode), int(relnode))
 
     for frame_size in sizes:
-        smgr_before = metric_value(SMGR_STARTED_METRIC, smgr_filters, env)
-        vectored_before = metric_value(GET_VECTORED_COUNT_METRIC, get_vectored_filters, env)
-        result = run_get_pages_frame(
+        # Warm the test relation once outside the counters. The measured frames are then a
+        # cache-warm repeated gRPC workload, which makes the per-frame latency sample less
+        # sensitive to initial layer loading while retaining the oversized-request behavior.
+        warmup_result = run_get_pages_frame(
             pg_bin,
             neon_binpath,
             env,
@@ -133,27 +142,60 @@ def test_grpc_get_pages_large_frames(
             relation,
             frame_size,
         )
+        assert warmup_result["requested_pages"] == frame_size
+        assert warmup_result["returned_pages"] == frame_size
+
+        smgr_before = metric_value(SMGR_STARTED_METRIC, smgr_filters, env)
+        vectored_before = metric_value(GET_VECTORED_COUNT_METRIC, get_vectored_filters, env)
+        results = [
+            run_get_pages_frame(
+                pg_bin,
+                neon_binpath,
+                env,
+                read_lsn,
+                relation,
+                frame_size,
+            )
+            for _ in range(repetitions)
+        ]
         smgr_after = metric_value(SMGR_STARTED_METRIC, smgr_filters, env)
         vectored_after = metric_value(GET_VECTORED_COUNT_METRIC, get_vectored_filters, env)
 
-        timer_starts = int(smgr_after - smgr_before)
-        vectored_calls = int(vectored_after - vectored_before)
-        assert result["requested_pages"] == frame_size
-        assert result["returned_pages"] == frame_size
-        assert timer_starts >= frame_size
-        assert vectored_calls >= 1
+        timer_starts_total = int(smgr_after - smgr_before)
+        vectored_calls_total = int(vectored_after - vectored_before)
+        assert all(result["requested_pages"] == frame_size for result in results)
+        assert all(result["returned_pages"] == frame_size for result in results)
+        assert timer_starts_total >= repetitions * frame_size
+        assert vectored_calls_total >= repetitions
+        assert timer_starts_total % repetitions == 0
+        assert vectored_calls_total % repetitions == 0
+
+        timer_starts = timer_starts_total // repetitions
+        vectored_calls = vectored_calls_total // repetitions
+        request_messages_total = sum(result["grpc_request_messages"] for result in results)
+        oversized_fallbacks_total = sum(result["oversized_fallbacks"] for result in results)
+        returned_pages_total = sum(result["returned_pages"] for result in results)
+        elapsed_ns_total = sum(result["elapsed_ns"] for result in results)
+        assert request_messages_total % repetitions == 0
+        assert oversized_fallbacks_total % repetitions == 0
+        assert returned_pages_total % repetitions == 0
+
+        request_messages = request_messages_total // repetitions
+        oversized_fallbacks = oversized_fallbacks_total // repetitions
+        returned_pages = returned_pages_total // repetitions
+        elapsed_ns = elapsed_ns_total / repetitions
 
         # The legacy path starts one timer for the rejected over-cap frame and one more for its
         # validated fallback chunks: two starts per requested page. Any material reduction below
-        # that legacy shape must therefore be a direct response, not an early rejection that lets
-        # this helper mask the failure by retrying. A one-message frame is unambiguous because the
-        # helper's only fallback appends all in-cap chunks.
+        # that legacy shape must therefore be direct for every measured frame, not an early
+        # rejection that lets this helper mask the failure by retrying.
         if timer_starts < 2 * frame_size:
-            assert result["oversized_fallbacks"] == 0
-            assert result["grpc_request_messages"] == 1
+            assert all(result["oversized_fallbacks"] == 0 for result in results)
+            assert all(result["grpc_request_messages"] == 1 for result in results)
 
-        # Each line is a single native-integration-test sample. The Perfloop controller repeats
-        # this test invocation and compares the server-attributed counters across revisions.
+        # Each line is one cache-warm native-integration-test sample: the mean of independent
+        # validated gRPC frames. The Perfloop controller repeats this invocation across revisions,
+        # while every frame still validates page images and response order.
         print(
             json.dumps(
                 {
@@ -174,7 +216,7 @@ def test_grpc_get_pages_large_frames(
             json.dumps(
                 {
                     "metric": "grpc_request_messages_per_completed_frame",
-                    "value": result["grpc_request_messages"],
+                    "value": request_messages,
                 }
             )
         )
@@ -182,7 +224,7 @@ def test_grpc_get_pages_large_frames(
             json.dumps(
                 {
                     "metric": "grpc_oversized_fallbacks_per_completed_frame",
-                    "value": result["oversized_fallbacks"],
+                    "value": oversized_fallbacks,
                 }
             )
         )
@@ -190,7 +232,7 @@ def test_grpc_get_pages_large_frames(
             json.dumps(
                 {
                     "metric": "grpc_pages_returned_per_completed_frame",
-                    "value": result["returned_pages"],
+                    "value": returned_pages,
                 }
             )
         )
@@ -198,20 +240,21 @@ def test_grpc_get_pages_large_frames(
             json.dumps(
                 {
                     "metric": "grpc_frame_elapsed_ns",
-                    "value": result["elapsed_ns"],
+                    "value": elapsed_ns,
                 }
             )
         )
         print(
-            f"verified_grpc_get_pages_frame size={frame_size} pages={result['returned_pages']} "
-            f"order=preserved oversized_fallbacks={result['oversized_fallbacks']}"
+            f"verified_grpc_get_pages_frame size={frame_size} pages={returned_pages} "
+            f"order=preserved oversized_fallbacks={oversized_fallbacks} repetitions={repetitions}"
         )
         log.info(
             "verified gRPC GetPages frame size=%s timer_starts=%s vectored_calls=%s "
-            "request_messages=%s oversized_fallbacks=%s",
+            "request_messages=%s oversized_fallbacks=%s repetitions=%s",
             frame_size,
             timer_starts,
             vectored_calls,
-            result["grpc_request_messages"],
-            result["oversized_fallbacks"],
+            request_messages,
+            oversized_fallbacks,
+            repetitions,
         )
