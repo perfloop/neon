@@ -119,6 +119,10 @@ const GRPC_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// like 8 GetPage streams per connections, plus any unary requests.
 const GRPC_MAX_CONCURRENT_STREAMS: u32 = 256;
 
+// A single gRPC frame may exceed one vectored read, but must not turn the wire
+// message limit into unbounded server-side work.
+const MAX_GET_PAGE_FRAME_CHUNKS: usize = 4;
+
 ///////////////////////////////////////////////////////////////////////////////
 
 pub struct Listener {
@@ -3529,10 +3533,6 @@ impl GrpcPageServiceHandler {
     ///
     /// NB: errors returned from here are intercepted in get_pages(), and may be converted to a
     /// GetPageResponse with an appropriate status code to avoid terminating the stream.
-    ///
-    /// TODO: get_vectored() currently enforces a batch limit of 32. Postgres will typically send
-    /// batches up to effective_io_concurrency = 100. Either we have to accept large batches, or
-    /// split them up in the client or server.
     #[instrument(skip_all, fields(
         req_id = %req.request_id,
         rel = %req.rel,
@@ -3547,6 +3547,15 @@ impl GrpcPageServiceHandler {
         io_concurrency: IoConcurrency,
         received_at: Instant,
     ) -> Result<page_api::GetPageResponse, tonic::Status> {
+        let max_get_vectored_keys = timeline.conf.max_get_vectored_keys.get();
+        let max_frame_blocks = max_get_vectored_keys.saturating_mul(MAX_GET_PAGE_FRAME_CHUNKS);
+        if req.block_numbers.len() > max_frame_blocks {
+            return Err(tonic::Status::invalid_argument(format!(
+                "GetPages request has {} blocks, limit is {max_frame_blocks}",
+                req.block_numbers.len(),
+            )));
+        }
+
         let ctx = ctx.with_scope_page_service_pagestream(&timeline);
 
         for &blkno in &req.block_numbers {
@@ -3573,67 +3582,71 @@ impl GrpcPageServiceHandler {
             &latest_gc_cutoff_lsn,
         )?;
 
-        let mut batch = SmallVec::with_capacity(req.block_numbers.len());
-        for blkno in req.block_numbers {
-            // TODO: this creates one timer per page and throttles it. We should have a timer for
-            // the entire batch, and throttle only the batch, but this is equivalent to what
-            // PageServerHandler does already so we keep it for now.
-            let timer = Self::record_op_start_and_throttle(
-                &timeline,
-                metrics::SmgrQueryType::GetPageAtLsn,
-                received_at,
-            )
-            .await?;
-
-            batch.push(BatchedGetPageRequest {
-                req: PagestreamGetPageRequest {
-                    hdr: Self::make_hdr(req.read_lsn, Some(req.request_id)),
-                    rel: req.rel,
-                    blkno,
-                },
-                lsn_range: LsnRange {
-                    effective_lsn,
-                    request_lsn: req.read_lsn.request_lsn,
-                },
-                timer,
-                ctx: ctx.attached_child(),
-                batch_wait_ctx: None, // TODO: add tracing
-            });
-        }
-
-        // TODO: this does a relation size query for every page in the batch. Since this batch is
-        // all for one relation, we could do this only once. However, this is not the case for the
-        // libpq implementation.
-        let results = PageServerHandler::handle_get_page_at_lsn_request_batched(
-            &timeline,
-            batch,
-            io_concurrency,
-            GetPageBatchBreakReason::BatchFull, // TODO: not relevant for gRPC batches
-            &ctx,
-        )
-        .await;
-
         let mut resp = page_api::GetPageResponse {
             request_id: req.request_id,
             status_code: page_api::GetPageStatusCode::Ok,
             reason: None,
             rel: req.rel,
-            pages: Vec::with_capacity(results.len()),
+            pages: Vec::with_capacity(req.block_numbers.len()),
         };
 
-        for result in results {
-            match result {
-                Ok((PagestreamBeMessage::GetPage(r), _, _)) => resp.pages.push(page_api::Page {
-                    block_number: r.req.blkno,
-                    image: r.page,
-                }),
-                Ok((resp, _, _)) => {
-                    return Err(tonic::Status::internal(format!(
-                        "unexpected response: {resp:?}"
-                    )));
-                }
-                Err(err) => return Err(err.err.into()),
-            };
+        for block_numbers in req.block_numbers.chunks(max_get_vectored_keys) {
+            let mut batch = SmallVec::with_capacity(block_numbers.len());
+            for &blkno in block_numbers {
+                // TODO: this creates one timer per page and throttles it. We should have a timer for
+                // the entire batch, and throttle only the batch, but this is equivalent to what
+                // PageServerHandler does already so we keep it for now.
+                let timer = Self::record_op_start_and_throttle(
+                    &timeline,
+                    metrics::SmgrQueryType::GetPageAtLsn,
+                    received_at,
+                )
+                .await?;
+
+                batch.push(BatchedGetPageRequest {
+                    req: PagestreamGetPageRequest {
+                        hdr: Self::make_hdr(req.read_lsn, Some(req.request_id)),
+                        rel: req.rel,
+                        blkno,
+                    },
+                    lsn_range: LsnRange {
+                        effective_lsn,
+                        request_lsn: req.read_lsn.request_lsn,
+                    },
+                    timer,
+                    ctx: ctx.attached_child(),
+                    batch_wait_ctx: None, // TODO: add tracing
+                });
+            }
+
+            // TODO: this does a relation size query for every page in the batch. Since this batch is
+            // all for one relation, we could do this only once. However, this is not the case for the
+            // libpq implementation.
+            let results = PageServerHandler::handle_get_page_at_lsn_request_batched(
+                &timeline,
+                batch,
+                io_concurrency.clone(),
+                GetPageBatchBreakReason::BatchFull, // TODO: not relevant for gRPC batches
+                &ctx,
+            )
+            .await;
+
+            for result in results {
+                match result {
+                    Ok((PagestreamBeMessage::GetPage(r), _, _)) => {
+                        resp.pages.push(page_api::Page {
+                            block_number: r.req.blkno,
+                            image: r.page,
+                        });
+                    }
+                    Ok((resp, _, _)) => {
+                        return Err(tonic::Status::internal(format!(
+                            "unexpected response: {resp:?}"
+                        )));
+                    }
+                    Err(err) => return Err(err.err.into()),
+                };
+            }
         }
 
         Ok(resp)
