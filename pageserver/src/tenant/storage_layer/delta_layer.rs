@@ -924,24 +924,10 @@ impl DeltaLayerInner {
             .page_content_kind(PageContentKind::DeltaLayerBtreeNode)
             .attached_child();
         let range_count = keyspace.ranges.len();
-        // The cache is useful only when at least two walker visits follow the
-        // initial stream. Retain the stream path at both outer ranges: this
-        // avoids building a cache for a cold last visit while leaving its
-        // bounded reuse to the interior of larger fragmented keyspaces.
-        let mut first_reader = Some(index_reader);
-        let stream_reader = (range_count > 1).then(|| {
-            first_reader
-                .as_ref()
-                .expect("the first reader is present before traversal")
-                .clone()
-        });
-        let mut index_walker = (range_count > 3).then(|| {
-            first_reader
-                .as_ref()
-                .expect("the first reader is present before traversal")
-                .clone()
-                .into_range_walker()
-        });
+        // Cache a path only when two interior ranges can use it. Outer ranges
+        // retain the original stream path, avoiding a cold cache that has no
+        // later walker visit to amortize it.
+        let mut index_walker = (range_count > 3).then(|| index_reader.clone().into_range_walker());
 
         for (range_index, range) in keyspace.ranges.iter().enumerate() {
             let mut range_end_handled = false;
@@ -983,17 +969,7 @@ impl DeltaLayerInner {
                     .visit(&start_key.0, &mut handle_index_entry, &ctx)
                     .await?;
             } else {
-                let reader = if range_index == 0 {
-                    first_reader
-                        .take()
-                        .expect("the first reader is consumed by the first range")
-                } else {
-                    stream_reader
-                        .as_ref()
-                        .expect("later ranges have a reusable stream reader")
-                        .clone()
-                };
-                let index_stream = reader.into_stream(&start_key.0, &ctx);
+                let index_stream = index_reader.clone().into_stream(&start_key.0, &ctx);
                 let mut index_stream = std::pin::pin!(index_stream);
                 while let Some(index_entry) = index_stream.next().await {
                     let (raw_key, value) = index_entry?;
