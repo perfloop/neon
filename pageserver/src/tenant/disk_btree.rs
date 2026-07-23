@@ -532,6 +532,11 @@ where
     }
 }
 
+// Keep request-local retained index pages bounded independently of on-disk
+// level values. Eight 8 KiB pages cap this cache at 64 KiB while retaining the
+// full path for the shallow trees expected in normal delta layers.
+const MAX_CACHED_BTREE_NODES: usize = 8;
+
 #[derive(Default)]
 struct DiskBtreePathCache {
     nodes: Vec<CachedBtreeNode>,
@@ -559,9 +564,23 @@ impl DiskBtreePathCache {
             .find(|previous| previous.level == level)
         {
             *previous = cached;
-        } else {
-            self.nodes.push(cached);
+            return;
         }
+
+        if self.nodes.len() == MAX_CACHED_BTREE_NODES {
+            // Higher levels are shared by more future seeks. Evict the lowest
+            // cached level first; eviction only loses reuse, never traversal
+            // correctness.
+            let evict = self
+                .nodes
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, cached)| cached.level)
+                .expect("a full cache has a node")
+                .0;
+            self.nodes.swap_remove(evict);
+        }
+        self.nodes.push(cached);
     }
 }
 
@@ -581,8 +600,8 @@ where
     /// Visit keys greater than or equal to `search_key`.
     ///
     /// Calls with increasing search keys reuse the shared prefix of their
-    /// root-to-leaf paths. The cache is bounded to one node per tree level, so
-    /// a wide range scan does not retain all leaves it crosses.
+    /// root-to-leaf paths. The cache is capped at a fixed number of pages, so
+    /// malformed level values and wide range scans cannot grow retained state.
     pub(crate) async fn visit<V>(
         &mut self,
         search_key: &[u8; L],
@@ -1107,6 +1126,16 @@ pub(crate) mod tests {
             self.blocks.push(buf);
             Ok(blknum as u32)
         }
+    }
+
+    #[test]
+    fn path_cache_is_bounded_for_untrusted_levels() {
+        let mut cache = DiskBtreePathCache::default();
+        for level in 0..=u8::MAX {
+            cache.insert(level.into(), level, Box::new([0_u8; PAGE_SZ]));
+            assert!(cache.nodes.len() <= MAX_CACHED_BTREE_NODES);
+        }
+        assert_eq!(cache.nodes.len(), MAX_CACHED_BTREE_NODES);
     }
 
     #[tokio::test]

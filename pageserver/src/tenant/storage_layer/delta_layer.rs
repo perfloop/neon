@@ -923,59 +923,94 @@ impl DeltaLayerInner {
         let ctx = RequestContextBuilder::from(ctx)
             .page_content_kind(PageContentKind::DeltaLayerBtreeNode)
             .attached_child();
-        let range_count = keyspace.ranges.len();
-        // Cache a path only when two interior ranges can use it. Outer ranges
-        // retain the original stream path, avoiding a cold cache that has no
-        // later walker visit to amortize it.
-        let mut index_walker = (range_count > 3).then(|| index_reader.clone().into_range_walker());
+        // Once a batch has at least three ordered ranges, every range shares
+        // the same walker. The cold first seek has later visits to amortize it,
+        // and the final seek can reuse the retained path instead of restarting
+        // an independent root-to-leaf stream.
+        if keyspace.ranges.len() > 2 {
+            let mut index_walker = index_reader.into_range_walker();
+            for range in keyspace.ranges.iter() {
+                let mut range_end_handled = false;
+                let start_key = DeltaKey::from_key_lsn(&range.start, lsn_range.start);
+                let mut handle_index_entry = |raw_key: &[u8], value| {
+                    let key = Key::from_slice(&raw_key[..KEY_SIZE]);
+                    let lsn = DeltaKey::extract_lsn_from_buf(raw_key);
+                    let blob_ref = BlobRef(value);
 
-        for (range_index, range) in keyspace.ranges.iter().enumerate() {
+                    // Lsns are not monotonically increasing across keys, so we don't assert on them.
+                    assert!(key >= range.start);
+
+                    let flag = if !lsn_range.contains(&lsn) {
+                        BlobFlag::Ignore
+                    } else if blob_ref.will_init() {
+                        BlobFlag::ReplaceAll
+                    } else {
+                        // Usual path: add blob to the read.
+                        BlobFlag::None
+                    };
+
+                    if key >= range.end || (key.next() == range.end && lsn >= lsn_range.end) {
+                        planner.handle_range_end(blob_ref.pos());
+                        range_end_handled = true;
+                        false
+                    } else {
+                        planner.handle(key, lsn, blob_ref.pos(), flag);
+                        true
+                    }
+                };
+
+                index_walker
+                    .visit(&start_key.0, &mut handle_index_entry, &ctx)
+                    .await?;
+
+                if !range_end_handled {
+                    tracing::debug!("Handling range end fallback at {}", data_end_offset);
+                    planner.handle_range_end(data_end_offset);
+                }
+            }
+
+            return Ok(planner.finish());
+        }
+
+        // Preserve the original stream loop for the common small batches. In
+        // particular, a two-range request does not pay walker setup
+        // or dispatch overhead when it cannot reuse a retained path enough to
+        // amortize it.
+        for range in keyspace.ranges.iter() {
             let mut range_end_handled = false;
 
             let start_key = DeltaKey::from_key_lsn(&range.start, lsn_range.start);
-            let mut handle_index_entry = |raw_key: &[u8], value| {
+            let index_stream = index_reader.clone().into_stream(&start_key.0, &ctx);
+            let mut index_stream = std::pin::pin!(index_stream);
+
+            while let Some(index_entry) = index_stream.next().await {
+                let (raw_key, value) = index_entry?;
                 let key = Key::from_slice(&raw_key[..KEY_SIZE]);
-                let lsn = DeltaKey::extract_lsn_from_buf(raw_key);
+                let lsn = DeltaKey::extract_lsn_from_buf(&raw_key);
                 let blob_ref = BlobRef(value);
 
                 // Lsns are not monotonically increasing across keys, so we don't assert on them.
                 assert!(key >= range.start);
 
-                let flag = if !lsn_range.contains(&lsn) {
-                    BlobFlag::Ignore
-                } else if blob_ref.will_init() {
-                    BlobFlag::ReplaceAll
-                } else {
-                    // Usual path: add blob to the read.
-                    BlobFlag::None
+                let outside_lsn_range = !lsn_range.contains(&lsn);
+
+                let flag = {
+                    if outside_lsn_range {
+                        BlobFlag::Ignore
+                    } else if blob_ref.will_init() {
+                        BlobFlag::ReplaceAll
+                    } else {
+                        // Usual path: add blob to the read
+                        BlobFlag::None
+                    }
                 };
 
                 if key >= range.end || (key.next() == range.end && lsn >= lsn_range.end) {
                     planner.handle_range_end(blob_ref.pos());
                     range_end_handled = true;
-                    false
+                    break;
                 } else {
                     planner.handle(key, lsn, blob_ref.pos(), flag);
-                    true
-                }
-            };
-
-            let use_walker =
-                index_walker.is_some() && range_index > 0 && range_index + 1 < range_count;
-            if use_walker {
-                index_walker
-                    .as_mut()
-                    .expect("the interior walker is created for this range")
-                    .visit(&start_key.0, &mut handle_index_entry, &ctx)
-                    .await?;
-            } else {
-                let index_stream = index_reader.clone().into_stream(&start_key.0, &ctx);
-                let mut index_stream = std::pin::pin!(index_stream);
-                while let Some(index_entry) = index_stream.next().await {
-                    let (raw_key, value) = index_entry?;
-                    if !handle_index_entry(&raw_key, value) {
-                        break;
-                    }
                 }
             }
 
@@ -2485,11 +2520,9 @@ pub(crate) mod test {
             ranges: vec![
                 base_key..base_key.next(),
                 base_key.add(2)..base_key.add(2).next(),
-                // With a fourth logical range, this final selected range is
-                // an interior cached-walker visit. It reaches tree end and
-                // must flush with data_end_offset before the empty tail.
+                // This final selected range reaches tree end, so the walker
+                // must flush it with data_end_offset.
                 base_key.add(4)..base_key.add(4).next(),
-                base_key.add(5)..base_key.add(5).next(),
             ],
         };
         let data_end_offset = 10 * alignment;
