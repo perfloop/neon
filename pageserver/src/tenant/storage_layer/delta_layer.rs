@@ -2485,7 +2485,11 @@ pub(crate) mod test {
             ranges: vec![
                 base_key..base_key.next(),
                 base_key.add(2)..base_key.add(2).next(),
+                // With a fourth logical range, this final selected range is
+                // an interior cached-walker visit. It reaches tree end and
+                // must flush with data_end_offset before the empty tail.
                 base_key.add(4)..base_key.add(4).next(),
+                base_key.add(5)..base_key.add(5).next(),
             ],
         };
         let data_end_offset = 10 * alignment;
