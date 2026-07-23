@@ -865,8 +865,9 @@ impl DeltaLayerInner {
     // Look up the keys in the provided keyspace and update
     // the reconstruct state with whatever is found.
     //
-    // Currently, the index is visited for each range, but this
-    // can be further optimised to visit the index only once.
+    // Ordered fragmented ranges reuse the B-tree path from the preceding
+    // range, while the planner still receives an explicit end marker per
+    // logical range.
     pub(super) async fn get_values_reconstruct_data(
         &self,
         this: ResidentLayer,
@@ -917,49 +918,49 @@ impl DeltaLayerInner {
         ctx: &RequestContext,
     ) -> anyhow::Result<Vec<VectoredRead>>
     where
-        Reader: BlockReader + Clone,
+        Reader: BlockReader,
     {
         let ctx = RequestContextBuilder::from(ctx)
             .page_content_kind(PageContentKind::DeltaLayerBtreeNode)
             .attached_child();
+        let mut index_walker = index_reader.into_range_walker();
 
         for range in keyspace.ranges.iter() {
             let mut range_end_handled = false;
 
             let start_key = DeltaKey::from_key_lsn(&range.start, lsn_range.start);
-            let index_stream = index_reader.clone().into_stream(&start_key.0, &ctx);
-            let mut index_stream = std::pin::pin!(index_stream);
+            index_walker
+                .visit(
+                    &start_key.0,
+                    |raw_key, value| {
+                        let key = Key::from_slice(&raw_key[..KEY_SIZE]);
+                        let lsn = DeltaKey::extract_lsn_from_buf(raw_key);
+                        let blob_ref = BlobRef(value);
 
-            while let Some(index_entry) = index_stream.next().await {
-                let (raw_key, value) = index_entry?;
-                let key = Key::from_slice(&raw_key[..KEY_SIZE]);
-                let lsn = DeltaKey::extract_lsn_from_buf(&raw_key);
-                let blob_ref = BlobRef(value);
+                        // Lsns are not monotonically increasing across keys, so we don't assert on them.
+                        assert!(key >= range.start);
 
-                // Lsns are not monotonically increasing across keys, so we don't assert on them.
-                assert!(key >= range.start);
+                        let flag = if !lsn_range.contains(&lsn) {
+                            BlobFlag::Ignore
+                        } else if blob_ref.will_init() {
+                            BlobFlag::ReplaceAll
+                        } else {
+                            // Usual path: add blob to the read.
+                            BlobFlag::None
+                        };
 
-                let outside_lsn_range = !lsn_range.contains(&lsn);
-
-                let flag = {
-                    if outside_lsn_range {
-                        BlobFlag::Ignore
-                    } else if blob_ref.will_init() {
-                        BlobFlag::ReplaceAll
-                    } else {
-                        // Usual path: add blob to the read
-                        BlobFlag::None
-                    }
-                };
-
-                if key >= range.end || (key.next() == range.end && lsn >= lsn_range.end) {
-                    planner.handle_range_end(blob_ref.pos());
-                    range_end_handled = true;
-                    break;
-                } else {
-                    planner.handle(key, lsn, blob_ref.pos(), flag);
-                }
-            }
+                        if key >= range.end || (key.next() == range.end && lsn >= lsn_range.end) {
+                            planner.handle_range_end(blob_ref.pos());
+                            range_end_handled = true;
+                            false
+                        } else {
+                            planner.handle(key, lsn, blob_ref.pos(), flag);
+                            true
+                        }
+                    },
+                    &ctx,
+                )
+                .await?;
 
             if !range_end_handled {
                 tracing::debug!("Handling range end fallback at {}", data_end_offset);

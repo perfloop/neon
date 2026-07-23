@@ -21,6 +21,7 @@
 use std::cmp::Ordering;
 use std::iter::Rev;
 use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
 use std::{io, result};
 
 use async_stream::try_stream;
@@ -262,6 +263,18 @@ where
     {
         DiskBtreeIterator {
             stream: Box::pin(self.into_stream(start_key, ctx)),
+        }
+    }
+
+    /// Create a walker for ordered range seeks over this immutable tree.
+    ///
+    /// The walker retains one recently used node at every tree level. Adjacent
+    /// seeks can therefore reuse their shared root, internal nodes, and leaf
+    /// instead of rereading a root-to-leaf path for every range.
+    pub(crate) fn into_range_walker(self) -> DiskBtreeRangeWalker<R, L> {
+        DiskBtreeRangeWalker {
+            reader: self,
+            path_cache: DiskBtreePathCache::default(),
         }
     }
 
@@ -517,6 +530,145 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct DiskBtreePathCache {
+    nodes: Vec<CachedBtreeNode>,
+}
+
+struct CachedBtreeNode {
+    block: u32,
+    level: u8,
+    buf: Arc<[u8; PAGE_SZ]>,
+}
+
+impl DiskBtreePathCache {
+    fn get(&self, block: u32) -> Option<Arc<[u8; PAGE_SZ]>> {
+        self.nodes
+            .iter()
+            .find(|cached| cached.block == block)
+            .map(|cached| Arc::clone(&cached.buf))
+    }
+
+    fn insert(&mut self, block: u32, level: u8, buf: Arc<[u8; PAGE_SZ]>) {
+        let cached = CachedBtreeNode { block, level, buf };
+        if let Some(previous) = self
+            .nodes
+            .iter_mut()
+            .find(|previous| previous.level == level)
+        {
+            *previous = cached;
+        } else {
+            self.nodes.push(cached);
+        }
+    }
+}
+
+/// A B-tree walker that reuses the path traversed by ordered range seeks.
+pub(crate) struct DiskBtreeRangeWalker<R, const L: usize>
+where
+    R: BlockReader,
+{
+    reader: DiskBtreeReader<R, L>,
+    path_cache: DiskBtreePathCache,
+}
+
+impl<R, const L: usize> DiskBtreeRangeWalker<R, L>
+where
+    R: BlockReader,
+{
+    /// Visit keys greater than or equal to `search_key`.
+    ///
+    /// Calls with increasing search keys reuse the shared prefix of their
+    /// root-to-leaf paths. The cache is bounded to one node per tree level, so
+    /// a wide range scan does not retain all leaves it crosses.
+    pub(crate) async fn visit<V>(
+        &mut self,
+        search_key: &[u8; L],
+        mut visitor: V,
+        ctx: &RequestContext,
+    ) -> Result<bool>
+    where
+        V: FnMut(&[u8], u64) -> bool,
+    {
+        let mut stack = Vec::new();
+        stack.push((self.reader.root_blk, None));
+        let block_cursor = self.reader.reader.block_cursor();
+        while let Some((node_blknum, opt_iter)) = stack.pop() {
+            let (node_buf, cache_hit) = if let Some(cached) = self.path_cache.get(node_blknum) {
+                (cached, true)
+            } else {
+                let page_read_guard = block_cursor
+                    .read_blk(self.reader.start_blk + node_blknum, ctx)
+                    .await?;
+                let mut buf = [0_u8; PAGE_SZ];
+                buf.copy_from_slice(page_read_guard.as_ref());
+                (Arc::new(buf), false)
+            };
+
+            let (node_level, stopped) = {
+                let node = OnDiskNode::deparse(node_buf.as_ref())?;
+                let node_level = node.level;
+                let prefix_len = node.prefix_len as usize;
+                let suffix_len = node.suffix_len as usize;
+
+                assert!(node.num_children > 0);
+
+                let mut keybuf = Vec::new();
+                keybuf.extend(node.prefix);
+                keybuf.resize(prefix_len + suffix_len, 0);
+
+                let mut iter: Either<Range<usize>, Rev<RangeInclusive<usize>>> =
+                    if let Some(iter) = opt_iter {
+                        iter
+                    } else {
+                        // Locate the first match. Internal-node keys are lower
+                        // bounds, so a non-exact internal lookup descends through
+                        // the preceding child.
+                        let idx = match node.binary_search(search_key, keybuf.as_mut_slice()) {
+                            Ok(idx) => idx,
+                            Err(idx) => {
+                                if node.level == 0 {
+                                    idx
+                                } else {
+                                    idx.saturating_sub(1)
+                                }
+                            }
+                        };
+                        Either::Left(idx..node.num_children.into())
+                    };
+
+                let mut stopped = false;
+                while let Some(idx) = iter.next() {
+                    let key_off = idx * suffix_len;
+                    let suffix = &node.keys[key_off..key_off + suffix_len];
+                    keybuf[prefix_len..].copy_from_slice(suffix);
+                    let value = node.value(idx);
+                    if node.level == 0 {
+                        if !visitor(&keybuf, value.to_u64()) {
+                            stopped = true;
+                            break;
+                        }
+                    } else {
+                        stack.push((node_blknum, Some(iter)));
+                        stack.push((value.to_blknum(), None));
+                        break;
+                    }
+                }
+
+                (node_level, stopped)
+            };
+
+            if !cache_hit {
+                self.path_cache.insert(node_blknum, node_level, node_buf);
+            }
+            if stopped {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
