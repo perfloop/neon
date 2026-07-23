@@ -923,14 +923,27 @@ impl DeltaLayerInner {
         let ctx = RequestContextBuilder::from(ctx)
             .page_content_kind(PageContentKind::DeltaLayerBtreeNode)
             .attached_child();
-        // A single range has no later visit that could reuse a cached path, so
-        // retain the existing stream path. For fragmented keyspaces, start a
-        // bounded walker after that first range and reuse it for the rest.
-        let mut index_walker =
-            (keyspace.ranges.len() > 1).then(|| index_reader.clone().into_range_walker());
+        let range_count = keyspace.ranges.len();
+        // The cache is useful only when at least two walker visits follow the
+        // initial stream. Retain the stream path at both outer ranges: this
+        // avoids building a cache for a cold last visit while leaving its
+        // bounded reuse to the interior of larger fragmented keyspaces.
         let mut first_reader = Some(index_reader);
+        let stream_reader = (range_count > 1).then(|| {
+            first_reader
+                .as_ref()
+                .expect("the first reader is present before traversal")
+                .clone()
+        });
+        let mut index_walker = (range_count > 3).then(|| {
+            first_reader
+                .as_ref()
+                .expect("the first reader is present before traversal")
+                .clone()
+                .into_range_walker()
+        });
 
-        for range in keyspace.ranges.iter() {
+        for (range_index, range) in keyspace.ranges.iter().enumerate() {
             let mut range_end_handled = false;
 
             let start_key = DeltaKey::from_key_lsn(&range.start, lsn_range.start);
@@ -961,7 +974,25 @@ impl DeltaLayerInner {
                 }
             };
 
-            if let Some(reader) = first_reader.take() {
+            let use_walker =
+                index_walker.is_some() && range_index > 0 && range_index + 1 < range_count;
+            if use_walker {
+                index_walker
+                    .as_mut()
+                    .expect("the interior walker is created for this range")
+                    .visit(&start_key.0, &mut handle_index_entry, &ctx)
+                    .await?;
+            } else {
+                let reader = if range_index == 0 {
+                    first_reader
+                        .take()
+                        .expect("the first reader is consumed by the first range")
+                } else {
+                    stream_reader
+                        .as_ref()
+                        .expect("later ranges have a reusable stream reader")
+                        .clone()
+                };
                 let index_stream = reader.into_stream(&start_key.0, &ctx);
                 let mut index_stream = std::pin::pin!(index_stream);
                 while let Some(index_entry) = index_stream.next().await {
@@ -970,12 +1001,6 @@ impl DeltaLayerInner {
                         break;
                     }
                 }
-            } else {
-                index_walker
-                    .as_mut()
-                    .expect("a walker is created after the first range")
-                    .visit(&start_key.0, &mut handle_index_entry, &ctx)
-                    .await?;
             }
 
             if !range_end_handled {
