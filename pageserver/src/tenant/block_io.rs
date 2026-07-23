@@ -39,7 +39,7 @@ pub enum BlockLease<'a> {
     PageReadGuard(PageReadGuard<'static>),
     EphemeralFileMutableTail(&'a [u8; PAGE_SZ]),
     Slice(&'a [u8; PAGE_SZ]),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "benchmarking"))]
     Arc(std::sync::Arc<[u8; PAGE_SZ]>),
     #[cfg(test)]
     IoBufferMut(IoBufferMut),
@@ -51,7 +51,7 @@ impl From<PageReadGuard<'static>> for BlockLease<'static> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "benchmarking"))]
 impl From<std::sync::Arc<[u8; PAGE_SZ]>> for BlockLease<'_> {
     fn from(value: std::sync::Arc<[u8; PAGE_SZ]>) -> Self {
         BlockLease::Arc(value)
@@ -66,7 +66,7 @@ impl Deref for BlockLease<'_> {
             BlockLease::PageReadGuard(v) => v.deref(),
             BlockLease::EphemeralFileMutableTail(v) => v,
             BlockLease::Slice(v) => v,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "benchmarking"))]
             BlockLease::Arc(v) => v.deref(),
             #[cfg(test)]
             BlockLease::IoBufferMut(v) => {
@@ -85,6 +85,8 @@ pub(crate) enum BlockReaderRef<'a> {
     Adapter(Adapter<&'a DeltaLayerInner>),
     #[cfg(test)]
     TestDisk(&'a super::disk_btree::tests::TestDisk),
+    #[cfg(feature = "benchmarking")]
+    BenchmarkDisk(&'a super::disk_btree::benchmark::BenchmarkDisk),
     #[cfg(test)]
     VirtualFile(&'a VirtualFile),
 }
@@ -102,6 +104,8 @@ impl BlockReaderRef<'_> {
             Adapter(r) => r.read_blk(blknum, ctx).await,
             #[cfg(test)]
             TestDisk(r) => r.read_blk(blknum),
+            #[cfg(feature = "benchmarking")]
+            BenchmarkDisk(r) => r.read_blk(blknum),
             #[cfg(test)]
             VirtualFile(r) => r.read_blk(blknum, ctx).await,
         }

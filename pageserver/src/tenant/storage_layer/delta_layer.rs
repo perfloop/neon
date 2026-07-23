@@ -970,6 +970,29 @@ impl DeltaLayerInner {
         Ok(planner.finish())
     }
 
+    #[cfg(feature = "benchmarking")]
+    pub async fn plan_reads_for_benchmark<Reader>(
+        keyspace: &KeySpace,
+        lsn_range: Range<Lsn>,
+        data_end_offset: u64,
+        index_reader: DiskBtreeReader<Reader, DELTA_KEY_SIZE>,
+        max_read_size: usize,
+        ctx: &RequestContext,
+    ) -> anyhow::Result<Vec<VectoredRead>>
+    where
+        Reader: BlockReader + Clone,
+    {
+        Self::plan_reads(
+            keyspace,
+            lsn_range,
+            data_end_offset,
+            index_reader,
+            VectoredReadPlanner::new(max_read_size),
+            ctx,
+        )
+        .await
+    }
+
     fn get_min_read_buffer_size(
         planned_reads: &[VectoredRead],
         read_size_soft_max: usize,
@@ -1706,6 +1729,74 @@ pub(crate) mod test {
         .expect("Read planning should not fail");
 
         validate(keyspace, lsn_range, vectored_reads, entries);
+    }
+
+    #[tokio::test]
+    async fn test_delta_layer_index_traversal_fragmented_ranges() {
+        let base_key = Key {
+            field1: 0,
+            field2: 1663,
+            field3: 12972,
+            field4: 16396,
+            field5: 0,
+            field6: 246080,
+        };
+        let indexed_lsns = [(Lsn(80), false), (Lsn(100), true), (Lsn(120), false)];
+
+        let mut disk = TestDisk::default();
+        let mut writer = DiskBtreeBuilder::<_, DELTA_KEY_SIZE>::new(&mut disk);
+        let mut disk_offset = 0;
+        for key_offset in 0..9 {
+            let key = base_key.add(key_offset);
+            for (lsn, will_init) in indexed_lsns {
+                let index_key = DeltaKey::from_key_lsn(&key, lsn);
+                writer
+                    .append(&index_key.0, BlobRef::new(disk_offset, will_init).0)
+                    .expect("in-memory disk append should never fail");
+                disk_offset += 1;
+            }
+        }
+
+        let (root_offset, _writer) = writer
+            .finish()
+            .expect("in-memory disk finish should never fail");
+        let reader = DiskBtreeReader::<_, DELTA_KEY_SIZE>::new(0, root_offset, disk);
+        let keyspace = KeySpace {
+            ranges: vec![
+                base_key..base_key.add(1),
+                base_key.add(3)..base_key.add(4),
+                base_key.add(6)..base_key.add(7),
+                // This range has no index entries, so it reaches the range-end fallback.
+                base_key.add(9)..base_key.add(10),
+            ],
+        };
+        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
+
+        let reads = DeltaLayerInner::plan_reads(
+            &keyspace,
+            Lsn(90)..Lsn(130),
+            disk_offset,
+            reader,
+            VectoredReadPlanner::new(100),
+            &ctx,
+        )
+        .await
+        .expect("read planning should not fail");
+
+        let actual: Vec<_> = reads
+            .iter()
+            .flat_map(|read| read.blobs_at.as_slice())
+            .map(|(_, blob)| (blob.key, blob.lsn, blob.will_init))
+            .collect();
+        let expected: Vec<_> = [0, 3, 6]
+            .into_iter()
+            .flat_map(|key_offset| {
+                let key = base_key.add(key_offset);
+                [(key, Lsn(100), true), (key, Lsn(120), false)]
+            })
+            .collect();
+
+        assert_eq!(actual, expected);
     }
 
     fn validate(

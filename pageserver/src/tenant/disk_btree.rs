@@ -826,6 +826,101 @@ impl<const L: usize> BuildNode<L> {
     }
 }
 
+#[cfg(feature = "benchmarking")]
+pub mod benchmark {
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use crate::page_cache::PAGE_SZ;
+    use crate::tenant::block_io::{
+        BlockCursor, BlockLease, BlockReader, BlockReaderRef, BlockWriter,
+    };
+    use crate::virtual_file::IoBuffer;
+
+    #[derive(Default)]
+    struct BenchmarkDiskState {
+        blocks: Mutex<Vec<Arc<[u8; PAGE_SZ]>>>,
+        reads: AtomicUsize,
+    }
+
+    /// In-memory B-tree backing storage for benchmarks. A counting clone is used
+    /// for a setup-only traversal; a non-counting clone avoids instrumentation in
+    /// Criterion's timed path.
+    #[derive(Clone)]
+    pub struct BenchmarkDisk {
+        state: Arc<BenchmarkDiskState>,
+        count_reads: bool,
+    }
+
+    impl Default for BenchmarkDisk {
+        fn default() -> Self {
+            Self {
+                state: Arc::new(BenchmarkDiskState::default()),
+                count_reads: true,
+            }
+        }
+    }
+
+    impl BenchmarkDisk {
+        pub fn without_read_counter(&self) -> Self {
+            Self {
+                state: self.state.clone(),
+                count_reads: false,
+            }
+        }
+
+        pub fn reset_read_count(&self) {
+            self.state.reads.store(0, Ordering::Relaxed);
+        }
+
+        pub fn read_count(&self) -> usize {
+            self.state.reads.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn read_blk(&self, blknum: u32) -> io::Result<BlockLease<'static>> {
+            if self.count_reads {
+                self.state.reads.fetch_add(1, Ordering::Relaxed);
+            }
+            let blocks = self
+                .state
+                .blocks
+                .lock()
+                .expect("benchmark disk lock poisoned");
+            let block = blocks.get(blknum as usize).cloned().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("missing benchmark disk block {blknum}"),
+                )
+            })?;
+            Ok(BlockLease::Arc(block))
+        }
+    }
+
+    impl BlockReader for BenchmarkDisk {
+        fn block_cursor(&self) -> BlockCursor<'_> {
+            BlockCursor::new(BlockReaderRef::BenchmarkDisk(self))
+        }
+    }
+
+    impl BlockWriter for &mut BenchmarkDisk {
+        fn write_blk(&mut self, buf: IoBuffer) -> Result<u32, io::Error> {
+            let mut block = [0_u8; PAGE_SZ];
+            block.copy_from_slice(&buf);
+
+            let mut blocks = self
+                .state
+                .blocks
+                .lock()
+                .expect("benchmark disk lock poisoned");
+            let blknum = u32::try_from(blocks.len())
+                .map_err(|_| io::Error::other("too many benchmark disk blocks"))?;
+            blocks.push(Arc::new(block));
+            Ok(blknum)
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeMap;

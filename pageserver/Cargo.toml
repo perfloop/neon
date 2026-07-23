@@ -125,6 +125,10 @@ uuid.workspace = true
 rstest.workspace = true
 
 [[bench]]
+name = "bench_delta_layer_plan_reads"
+harness = false
+
+[[bench]]
 name = "bench_layer_map"
 harness = false
 
