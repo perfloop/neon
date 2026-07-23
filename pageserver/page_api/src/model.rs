@@ -298,9 +298,13 @@ pub struct GetPageRequest {
     pub rel: RelTag,
     /// Page numbers to read. Must belong to the remote shard.
     ///
-    /// Multiple pages will be executed as a single batch by the Pageserver, amortizing layer access
-    /// costs and parallelizing them. This may increase the latency of any individual request, but
-    /// improves the overall latency and throughput of the batch as a whole.
+    /// One frame may contain at most `4 * max_get_vectored_keys` blocks, where
+    /// `max_get_vectored_keys` is the Pageserver's configured per-batch limit. An accepted frame
+    /// is partitioned into internal batches no larger than that limit. On the ordinary single-shard
+    /// path batches run consecutively. During stale-parent rerouting after a shard split, the server
+    /// may instead partition by child shard and execute child batches concurrently. In both cases,
+    /// the aggregate frame limit is enforced before the request is partitioned; a larger frame is
+    /// rejected with InvalidRequest.
     pub block_numbers: Vec<u32>,
 }
 
@@ -438,10 +442,11 @@ impl From<GetPageClass> for i32 {
 
 /// A GetPage response.
 ///
-/// A batch response will contain all of the requested pages. We could eagerly emit individual pages
-/// as soon as they are ready, but on a readv() Postgres holds buffer pool locks on all pages in the
-/// batch and we'll only return once the entire batch is ready, so no one can make use of the
-/// individual pages.
+/// A successful response contains all requested pages. We could eagerly emit individual pages as
+/// soon as they are ready, but on a readv() Postgres holds buffer pool locks on all pages in the
+/// batch and we'll only return once the entire frame is ready, so no one can make use of the
+/// individual pages. A non-OK response keeps the request ID and contains no partial pages,
+/// including when a later internal batch fails after earlier batches completed.
 #[derive(Clone, Debug)]
 pub struct GetPageResponse {
     /// The original request's ID.

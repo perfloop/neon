@@ -61,9 +61,7 @@ def test_grpc_get_pages_late_chunk_error_is_empty(
     neon_binpath: Path,
     pg_bin: PgBin,
 ):
-    neon_env_builder.pageserver_config_override = (
-        f"max_get_vectored_keys={MAX_GET_VECTORED_KEYS}"
-    )
+    neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={MAX_GET_VECTORED_KEYS}"
     env = neon_env_builder.init_start()
     endpoint = env.endpoints.create_start("main")
     endpoint.safe_psql(
@@ -91,13 +89,12 @@ def test_grpc_get_pages_late_chunk_error_is_empty(
         env.initial_timeline,
     )
     env.pageserver.allowed_errors.append(r".*grpc:pageservice.*request failed with Internal:.*")
-    env.pageserver.http_client().configure_failpoints(
-        ("ps::grpc-get-pages-final-chunk", "return")
-    )
+    env.pageserver.http_client().configure_failpoints(("ps::grpc-get-pages-final-chunk", "return"))
 
     # All four 32-page chunks are valid. The test-only failpoint runs after the
     # fourth chunk has accumulated results, so the response must discard every
-    # prior chunk rather than expose a successful prefix.
+    # prior chunk rather than expose a successful prefix. This is deliberately
+    # a candidate regression test, not a baseline-compatible classifier.
     started = perf_counter_ns()
     result = run_late_chunk_error(
         pg_bin,
@@ -108,7 +105,7 @@ def test_grpc_get_pages_late_chunk_error_is_empty(
     )
     elapsed_ns = perf_counter_ns() - started
     assert result["response_pages"] == 0
-    assert result["outcome"] in ("legacy_internal", "final_chunk_injected_error")
+    assert result["outcome"] == "final_chunk_injected_error"
 
     print(json.dumps({"metric": "late_chunk_error_elapsed_ns", "value": elapsed_ns}))
     print(

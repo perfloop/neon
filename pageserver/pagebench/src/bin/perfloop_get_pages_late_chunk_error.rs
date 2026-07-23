@@ -1,6 +1,6 @@
 //! Verifies that a GetPages error in the final internal chunk is all-or-empty.
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::Parser;
 use futures::StreamExt;
 use pageserver_page_api as page_api;
@@ -85,16 +85,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let outcome = match (response.status_code, response.reason.as_deref()) {
-        // The baseline reaches the low-level vectored-read limit before it can
-        // enter four internal chunks.
-        (page_api::GetPageStatusCode::InternalError, Some("Read error")) => "legacy_internal",
-        // The candidate enables this failpoint after accumulating all fourth
-        // chunk pages, proving the stream wrapper discards the prefix.
+        // The failpoint runs after all four chunks have accumulated results.
+        // Accepting only this response proves the stream wrapper discarded that
+        // successful prefix rather than failing before it reached the fourth
+        // internal batch.
         (
             page_api::GetPageStatusCode::InternalError,
             Some("injected final internal GetPages batch error"),
         ) => "final_chunk_injected_error",
-        _ => bail!("late-chunk request returned an unexpected status or reason"),
+        _ => bail!("late-chunk request did not reach the injected final-batch error"),
     };
     println!(
         "{}",
