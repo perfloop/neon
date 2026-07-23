@@ -21,7 +21,6 @@
 use std::cmp::Ordering;
 use std::iter::Rev;
 use std::ops::{Range, RangeInclusive};
-use std::sync::Arc;
 use std::{io, result};
 
 use async_stream::try_stream;
@@ -541,18 +540,18 @@ struct DiskBtreePathCache {
 struct CachedBtreeNode {
     block: u32,
     level: u8,
-    buf: Arc<[u8; PAGE_SZ]>,
+    buf: Box<[u8; PAGE_SZ]>,
 }
 
 impl DiskBtreePathCache {
-    fn get(&self, block: u32) -> Option<Arc<[u8; PAGE_SZ]>> {
+    fn take(&mut self, block: u32) -> Option<CachedBtreeNode> {
         self.nodes
             .iter()
-            .find(|cached| cached.block == block)
-            .map(|cached| Arc::clone(&cached.buf))
+            .position(|cached| cached.block == block)
+            .map(|index| self.nodes.swap_remove(index))
     }
 
-    fn insert(&mut self, block: u32, level: u8, buf: Arc<[u8; PAGE_SZ]>) {
+    fn insert(&mut self, block: u32, level: u8, buf: Box<[u8; PAGE_SZ]>) {
         let cached = CachedBtreeNode { block, level, buf };
         if let Some(previous) = self
             .nodes
@@ -597,15 +596,15 @@ where
         stack.push((self.reader.root_blk, None));
         let block_cursor = self.reader.reader.block_cursor();
         while let Some((node_blknum, opt_iter)) = stack.pop() {
-            let (node_buf, cache_hit) = if let Some(cached) = self.path_cache.get(node_blknum) {
-                (cached, true)
+            let node_buf = if let Some(cached) = self.path_cache.take(node_blknum) {
+                cached.buf
             } else {
                 let page_read_guard = block_cursor
                     .read_blk(self.reader.start_blk + node_blknum, ctx)
                     .await?;
-                let mut buf = [0_u8; PAGE_SZ];
+                let mut buf = Box::new([0_u8; PAGE_SZ]);
                 buf.copy_from_slice(page_read_guard.as_ref());
-                (Arc::new(buf), false)
+                buf
             };
 
             let (node_level, stopped) = {
@@ -661,9 +660,7 @@ where
                 (node_level, stopped)
             };
 
-            if !cache_hit {
-                self.path_cache.insert(node_blknum, node_level, node_buf);
-            }
+            self.path_cache.insert(node_blknum, node_level, node_buf);
             if stopped {
                 return Ok(());
             }
