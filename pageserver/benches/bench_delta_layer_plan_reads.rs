@@ -9,7 +9,6 @@ use pageserver::tenant::storage_layer::delta_layer::{BlobRef, DELTA_KEY_SIZE, De
 use pageserver::tenant::vectored_blob_io::VectoredRead;
 use pageserver_api::key::{KEY_SIZE, Key};
 use pageserver_api::keyspace::KeySpace;
-use utils::bin_ser::BeSer;
 use utils::lsn::Lsn;
 
 const INDEXED_KEY_COUNT: u32 = 8192;
@@ -37,7 +36,7 @@ impl Fixture {
         &self,
         reader: DiskBtreeReader<BenchmarkDisk, DELTA_KEY_SIZE>,
     ) -> Vec<VectoredRead> {
-        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
+        let ctx = RequestContext::new(TaskKind::DebugTool, DownloadBehavior::Error);
         DeltaLayerInner::plan_reads_for_benchmark(
             &self.keyspace,
             self.lsn_range.clone(),
