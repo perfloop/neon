@@ -80,10 +80,6 @@ use crate::virtual_file::owned_buffers_io::write::{Buffer, BufferedWriterShutdow
 use crate::virtual_file::{self, IoBuffer, IoBufferMut, MaybeFatalIo, VirtualFile};
 use crate::{DELTA_FILE_MAGIC, STORAGE_FORMAT_VERSION, TEMP_FILE_SUFFIX};
 
-#[cfg(test)]
-#[path = "delta_layer_planner_bounds_test.rs"]
-mod planner_bounds_test;
-
 ///
 /// Header stored in the beginning of the file
 ///
@@ -2446,5 +2442,226 @@ pub(crate) mod test {
                 assert_delta_iter_equal(&mut iter, &test_deltas).await;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_delta_layer_index_traversal_fragmented_range_bounds() {
+        let base_key = Key {
+            field1: 0,
+            field2: 1663,
+            field3: 12972,
+            field4: 16396,
+            field5: 0,
+            field6: 246080,
+        };
+        let alignment = crate::virtual_file::get_io_buffer_alignment() as u64;
+        let indexed_entries = [
+            (base_key, 0),
+            // These entries are outside the selected ranges. Their positions are
+            // the required range-end boundaries for the preceding keys.
+            (base_key.add(1), 2 * alignment),
+            (base_key.add(2), 4 * alignment),
+            (base_key.add(3), 6 * alignment),
+            // The final selected key has no following index entry, so it must be
+            // flushed with data_end_offset instead.
+            (base_key.add(4), 8 * alignment),
+        ];
+
+        let mut disk = TestDisk::default();
+        let mut writer = DiskBtreeBuilder::<_, DELTA_KEY_SIZE>::new(&mut disk);
+        for (key, pos) in indexed_entries {
+            let index_key = DeltaKey::from_key_lsn(&key, Lsn(100));
+            writer
+                .append(&index_key.0, BlobRef::new(pos, false).0)
+                .expect("in-memory disk append should never fail");
+        }
+
+        let (root_offset, _writer) = writer
+            .finish()
+            .expect("in-memory disk finish should never fail");
+        let reader = DiskBtreeReader::<_, DELTA_KEY_SIZE>::new(0, root_offset, disk);
+        let keyspace = KeySpace {
+            ranges: vec![
+                base_key..base_key.next(),
+                base_key.add(2)..base_key.add(2).next(),
+                base_key.add(4)..base_key.add(4).next(),
+            ],
+        };
+        let data_end_offset = 10 * alignment;
+        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
+
+        let reads = DeltaLayerInner::plan_reads(
+            &keyspace,
+            Lsn(90)..Lsn(110),
+            data_end_offset,
+            reader,
+            VectoredReadPlanner::new(alignment as usize),
+            &ctx,
+        )
+        .await
+        .expect("read planning should not fail");
+
+        let bounds: Vec<_> = reads.iter().map(|read| (read.start, read.end)).collect();
+        assert_eq!(
+            bounds,
+            vec![
+                (0, 2 * alignment),
+                (4 * alignment, 6 * alignment),
+                (8 * alignment, data_end_offset),
+            ]
+        );
+        let actual: Vec<_> = reads
+            .iter()
+            .flat_map(|read| read.blobs_at.as_slice())
+            .map(|(at, blob)| (*at, blob.key, blob.lsn, blob.will_init))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (0, base_key, Lsn(100), false),
+                (4 * alignment, base_key.add(2), Lsn(100), false),
+                (8 * alignment, base_key.add(4), Lsn(100), false),
+            ]
+        );
+    }
+
+    async fn plan_reads_with_independent_streams<Reader>(
+        keyspace: &KeySpace,
+        lsn_range: Range<Lsn>,
+        data_end_offset: u64,
+        index_reader: DiskBtreeReader<Reader, DELTA_KEY_SIZE>,
+        mut planner: VectoredReadPlanner,
+        ctx: &RequestContext,
+    ) -> anyhow::Result<Vec<VectoredRead>>
+    where
+        Reader: BlockReader + Clone,
+    {
+        let ctx = RequestContextBuilder::from(ctx)
+            .page_content_kind(PageContentKind::DeltaLayerBtreeNode)
+            .attached_child();
+
+        for range in keyspace.ranges.iter() {
+            let start_key = DeltaKey::from_key_lsn(&range.start, lsn_range.start);
+            let index_stream = index_reader.clone().into_stream(&start_key.0, &ctx);
+            let mut index_stream = std::pin::pin!(index_stream);
+            let mut range_end_handled = false;
+
+            while let Some(index_entry) = index_stream.next().await {
+                let (raw_key, value) = index_entry?;
+                let key = Key::from_slice(&raw_key[..KEY_SIZE]);
+                let lsn = DeltaKey::extract_lsn_from_buf(&raw_key);
+                let blob_ref = BlobRef(value);
+
+                assert!(key >= range.start);
+                let flag = if !lsn_range.contains(&lsn) {
+                    BlobFlag::Ignore
+                } else if blob_ref.will_init() {
+                    BlobFlag::ReplaceAll
+                } else {
+                    BlobFlag::None
+                };
+
+                if key >= range.end || (key.next() == range.end && lsn >= lsn_range.end) {
+                    planner.handle_range_end(blob_ref.pos());
+                    range_end_handled = true;
+                    break;
+                }
+                planner.handle(key, lsn, blob_ref.pos(), flag);
+            }
+
+            if !range_end_handled {
+                planner.handle_range_end(data_end_offset);
+            }
+        }
+
+        Ok(planner.finish())
+    }
+
+    fn read_description(reads: &[VectoredRead]) -> Vec<(u64, u64, Vec<(u64, Key, Lsn, bool)>)> {
+        reads
+            .iter()
+            .map(|read| {
+                (
+                    read.start,
+                    read.end,
+                    read.blobs_at
+                        .as_slice()
+                        .iter()
+                        .map(|(at, blob)| (*at, blob.key, blob.lsn, blob.will_init))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_delta_layer_index_traversal_multilevel_matches_independent_streams() {
+        const KEY_COUNT: u32 = 8192;
+        // The adjacent first pair stays in one leaf; later selections span
+        // several leaf pages and require internal-node continuation.
+        const SELECTED_KEYS: [u32; 8] = [1024, 1026, 1088, 1152, 2048, 4095, 6144, 8188];
+
+        let alignment = crate::virtual_file::get_io_buffer_alignment() as u64;
+        let base_key = Key {
+            field1: 0,
+            field2: 1663,
+            field3: 12972,
+            field4: 16396,
+            field5: 0,
+            field6: 246080,
+        };
+        let mut disk = TestDisk::default();
+        let mut writer = DiskBtreeBuilder::<_, DELTA_KEY_SIZE>::new(&mut disk);
+        let mut data_end_offset = 0;
+        for key_offset in 0..KEY_COUNT {
+            let key = base_key.add(key_offset);
+            for (lsn, will_init) in [(Lsn(80), false), (Lsn(100), true), (Lsn(120), false)] {
+                let index_key = DeltaKey::from_key_lsn(&key, lsn);
+                writer
+                    .append(&index_key.0, BlobRef::new(data_end_offset, will_init).0)
+                    .expect("in-memory disk append should never fail");
+                data_end_offset += alignment;
+            }
+        }
+        let (root_offset, _writer) = writer
+            .finish()
+            .expect("in-memory disk finish should never fail");
+        assert!(root_offset > 1, "fixture must span multiple B-tree pages");
+
+        let keyspace = KeySpace {
+            ranges: SELECTED_KEYS
+                .into_iter()
+                .map(|key_offset| {
+                    let key = base_key.add(key_offset);
+                    key..key.next()
+                })
+                .collect(),
+        };
+        let lsn_range = Lsn(90)..Lsn(110);
+        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
+        let max_read_size = 4 * alignment as usize;
+
+        let expected = plan_reads_with_independent_streams(
+            &keyspace,
+            lsn_range.clone(),
+            data_end_offset,
+            DiskBtreeReader::<_, DELTA_KEY_SIZE>::new(0, root_offset, disk.clone()),
+            VectoredReadPlanner::new(max_read_size),
+            &ctx,
+        )
+        .await
+        .expect("independent stream traversal should plan reads");
+        let actual = DeltaLayerInner::plan_reads(
+            &keyspace,
+            lsn_range,
+            data_end_offset,
+            DiskBtreeReader::<_, DELTA_KEY_SIZE>::new(0, root_offset, disk),
+            VectoredReadPlanner::new(max_read_size),
+            &ctx,
+        )
+        .await
+        .expect("cached walker should plan reads");
+
+        assert_eq!(read_description(&actual), read_description(&expected));
     }
 }
