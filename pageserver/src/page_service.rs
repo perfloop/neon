@@ -3594,13 +3594,11 @@ impl GrpcPageServiceHandler {
             &latest_gc_cutoff_lsn,
         )?;
 
-        let mut resp = page_api::GetPageResponse {
-            request_id: req.request_id,
-            status_code: page_api::GetPageStatusCode::Ok,
-            reason: None,
-            rel: req.rel,
-            pages: Vec::with_capacity(req.block_numbers.len()),
-        };
+        // Keep completed chunk pages local until every chunk has succeeded.
+        // Any later error returns from this function before a response can own a
+        // successful prefix; get_pages then converts that error into its empty
+        // per-request error response.
+        let mut pages = Vec::with_capacity(req.block_numbers.len());
 
         for (chunk_index, block_numbers) in
             req.block_numbers.chunks(max_get_vectored_keys).enumerate()
@@ -3648,7 +3646,7 @@ impl GrpcPageServiceHandler {
             for result in results {
                 match result {
                     Ok((PagestreamBeMessage::GetPage(r), _, _)) => {
-                        resp.pages.push(page_api::Page {
+                        pages.push(page_api::Page {
                             block_number: r.req.blkno,
                             image: r.page,
                         });
@@ -3671,7 +3669,13 @@ impl GrpcPageServiceHandler {
             }
         }
 
-        Ok(resp)
+        Ok(page_api::GetPageResponse {
+            request_id: req.request_id,
+            status_code: page_api::GetPageStatusCode::Ok,
+            reason: None,
+            rel: req.rel,
+            pages,
+        })
     }
 
     /// Processes a GetPage request when there is a potential shard split in progress. We have to
