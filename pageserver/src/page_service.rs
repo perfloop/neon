@@ -3508,15 +3508,11 @@ impl GrpcPageServiceHandler {
         }
     }
 
-    fn max_get_page_frame_blocks(max_get_vectored_keys: usize) -> usize {
-        max_get_vectored_keys.saturating_mul(MAX_GET_PAGE_FRAME_CHUNKS)
-    }
-
     fn validate_get_page_frame_size(
         req: &page_api::GetPageRequest,
         max_get_vectored_keys: usize,
     ) -> Result<(), tonic::Status> {
-        let max_frame_blocks = Self::max_get_page_frame_blocks(max_get_vectored_keys);
+        let max_frame_blocks = max_get_vectored_keys.saturating_mul(MAX_GET_PAGE_FRAME_CHUNKS);
         if req.block_numbers.len() > max_frame_blocks {
             return Err(tonic::Status::invalid_argument(format!(
                 "GetPages request has {} blocks, limit is {max_frame_blocks}",
@@ -3594,11 +3590,13 @@ impl GrpcPageServiceHandler {
             &latest_gc_cutoff_lsn,
         )?;
 
-        // Keep completed chunk pages local until every chunk has succeeded.
-        // Any later error returns from this function before a response can own a
-        // successful prefix; get_pages then converts that error into its empty
-        // per-request error response.
-        let mut pages = Vec::with_capacity(req.block_numbers.len());
+        let mut resp = page_api::GetPageResponse {
+            request_id: req.request_id,
+            status_code: page_api::GetPageStatusCode::Ok,
+            reason: None,
+            rel: req.rel,
+            pages: Vec::with_capacity(req.block_numbers.len()),
+        };
 
         for (chunk_index, block_numbers) in
             req.block_numbers.chunks(max_get_vectored_keys).enumerate()
@@ -3646,7 +3644,7 @@ impl GrpcPageServiceHandler {
             for result in results {
                 match result {
                     Ok((PagestreamBeMessage::GetPage(r), _, _)) => {
-                        pages.push(page_api::Page {
+                        resp.pages.push(page_api::Page {
                             block_number: r.req.blkno,
                             image: r.page,
                         });
@@ -3669,13 +3667,7 @@ impl GrpcPageServiceHandler {
             }
         }
 
-        Ok(page_api::GetPageResponse {
-            request_id: req.request_id,
-            status_code: page_api::GetPageStatusCode::Ok,
-            reason: None,
-            rel: req.rel,
-            pages,
-        })
+        Ok(resp)
     }
 
     /// Processes a GetPage request when there is a potential shard split in progress. We have to
