@@ -589,7 +589,7 @@ where
         search_key: &[u8; L],
         mut visitor: V,
         ctx: &RequestContext,
-    ) -> Result<bool>
+    ) -> Result<()>
     where
         V: FnMut(&[u8], u64) -> bool,
     {
@@ -665,10 +665,10 @@ where
                 self.path_cache.insert(node_blknum, node_level, node_buf);
             }
             if stopped {
-                return Ok(false);
+                return Ok(());
             }
         }
-        Ok(true)
+        Ok(())
     }
 }
 

@@ -80,6 +80,10 @@ use crate::virtual_file::owned_buffers_io::write::{Buffer, BufferedWriterShutdow
 use crate::virtual_file::{self, IoBuffer, IoBufferMut, MaybeFatalIo, VirtualFile};
 use crate::{DELTA_FILE_MAGIC, STORAGE_FORMAT_VERSION, TEMP_FILE_SUFFIX};
 
+#[cfg(test)]
+#[path = "delta_layer_planner_bounds_test.rs"]
+mod planner_bounds_test;
+
 ///
 /// Header stored in the beginning of the file
 ///
@@ -918,49 +922,65 @@ impl DeltaLayerInner {
         ctx: &RequestContext,
     ) -> anyhow::Result<Vec<VectoredRead>>
     where
-        Reader: BlockReader,
+        Reader: BlockReader + Clone,
     {
         let ctx = RequestContextBuilder::from(ctx)
             .page_content_kind(PageContentKind::DeltaLayerBtreeNode)
             .attached_child();
-        let mut index_walker = index_reader.into_range_walker();
+        // A single range has no later visit that could reuse a cached path, so
+        // retain the existing stream path. For fragmented keyspaces, start a
+        // bounded walker after that first range and reuse it for the rest.
+        let mut index_walker =
+            (keyspace.ranges.len() > 1).then(|| index_reader.clone().into_range_walker());
+        let mut first_reader = Some(index_reader);
 
         for range in keyspace.ranges.iter() {
             let mut range_end_handled = false;
 
             let start_key = DeltaKey::from_key_lsn(&range.start, lsn_range.start);
-            index_walker
-                .visit(
-                    &start_key.0,
-                    |raw_key, value| {
-                        let key = Key::from_slice(&raw_key[..KEY_SIZE]);
-                        let lsn = DeltaKey::extract_lsn_from_buf(raw_key);
-                        let blob_ref = BlobRef(value);
+            let mut handle_index_entry = |raw_key: &[u8], value| {
+                let key = Key::from_slice(&raw_key[..KEY_SIZE]);
+                let lsn = DeltaKey::extract_lsn_from_buf(raw_key);
+                let blob_ref = BlobRef(value);
 
-                        // Lsns are not monotonically increasing across keys, so we don't assert on them.
-                        assert!(key >= range.start);
+                // Lsns are not monotonically increasing across keys, so we don't assert on them.
+                assert!(key >= range.start);
 
-                        let flag = if !lsn_range.contains(&lsn) {
-                            BlobFlag::Ignore
-                        } else if blob_ref.will_init() {
-                            BlobFlag::ReplaceAll
-                        } else {
-                            // Usual path: add blob to the read.
-                            BlobFlag::None
-                        };
+                let flag = if !lsn_range.contains(&lsn) {
+                    BlobFlag::Ignore
+                } else if blob_ref.will_init() {
+                    BlobFlag::ReplaceAll
+                } else {
+                    // Usual path: add blob to the read.
+                    BlobFlag::None
+                };
 
-                        if key >= range.end || (key.next() == range.end && lsn >= lsn_range.end) {
-                            planner.handle_range_end(blob_ref.pos());
-                            range_end_handled = true;
-                            false
-                        } else {
-                            planner.handle(key, lsn, blob_ref.pos(), flag);
-                            true
-                        }
-                    },
-                    &ctx,
-                )
-                .await?;
+                if key >= range.end || (key.next() == range.end && lsn >= lsn_range.end) {
+                    planner.handle_range_end(blob_ref.pos());
+                    range_end_handled = true;
+                    false
+                } else {
+                    planner.handle(key, lsn, blob_ref.pos(), flag);
+                    true
+                }
+            };
+
+            if let Some(reader) = first_reader.take() {
+                let index_stream = reader.into_stream(&start_key.0, &ctx);
+                let mut index_stream = std::pin::pin!(index_stream);
+                while let Some(index_entry) = index_stream.next().await {
+                    let (raw_key, value) = index_entry?;
+                    if !handle_index_entry(&raw_key, value) {
+                        break;
+                    }
+                }
+            } else {
+                index_walker
+                    .as_mut()
+                    .expect("a walker is created after the first range")
+                    .visit(&start_key.0, &mut handle_index_entry, &ctx)
+                    .await?;
+            }
 
             if !range_end_handled {
                 tracing::debug!("Handling range end fallback at {}", data_end_offset);
