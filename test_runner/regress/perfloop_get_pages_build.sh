@@ -77,6 +77,16 @@ log="$log_dir/perfloop-get-pages-build.$$.log"
     test -x "$cargo_target_dir/debug/perfloop_get_pages_frame_boundaries"
     test -x "$cargo_target_dir/debug/perfloop_get_pages_late_chunk_preflight"
     test -f pg_install/v16/lib/postgresql/neon.so
+
+    if [[ -n "${PERFLOOP_BENCH_BIN:-}" ]]; then
+        install -d "$(dirname "$PERFLOOP_BENCH_BIN")"
+        cat >"$PERFLOOP_BENCH_BIN" <<'PERFLOOP_RUNNER'
+#!/usr/bin/env bash
+set -euo pipefail
+exec ./scripts/pytest -q -s test_runner/regress/test_grpc_get_pages_large_frames.py::test_grpc_get_pages_large_frames
+PERFLOOP_RUNNER
+        chmod +x "$PERFLOOP_BENCH_BIN"
+    fi
 ) >"$log" 2>&1
 status=$?
 
