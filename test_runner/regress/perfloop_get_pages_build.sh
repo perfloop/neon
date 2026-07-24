@@ -17,9 +17,19 @@ log="$log_dir/perfloop-get-pages-build.$$.log"
     export PIP_CACHE_DIR=/workspace/deps/pip
     export POETRY_CACHE_DIR=/workspace/deps/pip/poetry
     export POETRY_VIRTUALENVS_IN_PROJECT=true
-    export CARGO_TARGET_DIR="$PWD/target"
 
     git submodule update --init --recursive --depth 1 --jobs 8
+    cargo_target_dir=$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+    # The sandbox's Cargo launcher owns a worktree-keyed target directory.
+    # Tests expect NEON_BIN under ./target, so maintain only a local symlink.
+    if [[ -e target || -L target ]]; then
+        if [[ "$(readlink -f target)" != "$cargo_target_dir" ]]; then
+            rm -rf target
+            ln -s "$cargo_target_dir" target
+        fi
+    else
+        ln -s "$cargo_target_dir" target
+    fi
     flock /workspace/deps/perfloop-poetry.lock bash -euo pipefail -c '
         if [[ ! -x /workspace/deps/perfloop-poetry/bin/poetry ]]; then
             python3 -m venv /workspace/deps/perfloop-poetry
@@ -36,7 +46,7 @@ log="$log_dir/perfloop-get-pages-build.$$.log"
     CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
         cargo build --locked -p communicator --features testing,rest_broker
     BUILD_TYPE=debug make -j"$(nproc)" CARGO_BUILD_FLAGS='--locked --features testing,rest_broker' \
-        NEON_CARGO_ARTIFACT_TARGET_DIR="$CARGO_TARGET_DIR/debug" neon-pg-ext-v16
+        NEON_CARGO_ARTIFACT_TARGET_DIR="$cargo_target_dir/debug" neon-pg-ext-v16
 
     CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
         cargo build --locked -p pageserver --bin pageserver --features testing
@@ -56,16 +66,16 @@ log="$log_dir/perfloop-get-pages-build.$$.log"
         cargo build --locked -p pagebench --bin perfloop_get_pages_frame \
         --bin perfloop_get_pages_frame_boundaries --bin perfloop_get_pages_late_chunk_preflight
 
-    test -x "$CARGO_TARGET_DIR/debug/pageserver"
-    test -x "$CARGO_TARGET_DIR/debug/safekeeper"
-    test -x "$CARGO_TARGET_DIR/debug/storage_controller"
-    test -x "$CARGO_TARGET_DIR/debug/neon_local"
-    test -x "$CARGO_TARGET_DIR/debug/compute_ctl"
-    test -x "$CARGO_TARGET_DIR/debug/storage_broker"
-    test -x "$CARGO_TARGET_DIR/debug/endpoint_storage"
-    test -x "$CARGO_TARGET_DIR/debug/perfloop_get_pages_frame"
-    test -x "$CARGO_TARGET_DIR/debug/perfloop_get_pages_frame_boundaries"
-    test -x "$CARGO_TARGET_DIR/debug/perfloop_get_pages_late_chunk_preflight"
+    test -x "$cargo_target_dir/debug/pageserver"
+    test -x "$cargo_target_dir/debug/safekeeper"
+    test -x "$cargo_target_dir/debug/storage_controller"
+    test -x "$cargo_target_dir/debug/neon_local"
+    test -x "$cargo_target_dir/debug/compute_ctl"
+    test -x "$cargo_target_dir/debug/storage_broker"
+    test -x "$cargo_target_dir/debug/endpoint_storage"
+    test -x "$cargo_target_dir/debug/perfloop_get_pages_frame"
+    test -x "$cargo_target_dir/debug/perfloop_get_pages_frame_boundaries"
+    test -x "$cargo_target_dir/debug/perfloop_get_pages_late_chunk_preflight"
     test -f pg_install/v16/lib/postgresql/neon.so
 ) >"$log" 2>&1
 status=$?
