@@ -29,7 +29,7 @@ def metric(env: NeonEnv, name: str, filters: dict[str, str]) -> float:
     return 0.0 if value is None else value
 
 
-def setup(builder: NeonEnvBuilder, table: str, min_blocks: int, *, striped: bool = False):
+def make_relation(builder: NeonEnvBuilder, table: str, min_blocks: int, *, striped: bool = False):
     kwargs = {"initial_tenant_shard_count": 1, "initial_tenant_shard_stripe_size": 1} if striped else {}
     env = builder.init_start(**kwargs)
     endpoint = env.endpoints.create_start("main")
@@ -97,7 +97,7 @@ def test_grpc_get_pages_large_frames(
     sizes = [int(size) for size in os.environ.get("PERFLOOP_GRPC_GET_PAGE_FRAME_SIZES", "33,100").split(",") if size]
     repetitions = int(os.environ.get("PERFLOOP_GRPC_GET_PAGE_FRAME_REPETITIONS", "32"))
     assert sizes and all(size > 0 for size in sizes) and repetitions > 0
-    env, _, relation, lsn = setup(neon_env_builder, "perfloop_grpc_get_pages_frame", max(sizes))
+    env, _, relation, lsn = make_relation(neon_env_builder, "perfloop_grpc_get_pages_frame", max(sizes))
     env.pageserver.allowed_errors.append(r".*grpc:pageservice.*request failed with Internal: Read error.*")
     smgr_filters = {
         "smgr_query_type": "get_page_at_lsn",
@@ -138,7 +138,7 @@ def test_grpc_get_pages_frame_boundaries(
 ):
     neon_env_builder.num_pageservers = 1
     neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={CAP}"
-    env, _, relation, lsn = setup(neon_env_builder, "perfloop_grpc_get_pages_boundaries", FRAME_CAP + 1, striped=True)
+    env, _, relation, lsn = make_relation(neon_env_builder, "perfloop_grpc_get_pages_boundaries", FRAME_CAP + 1, striped=True)
     env.pageserver.allowed_errors.append(r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*")
     direct = [run(pg_bin, neon_binpath, env, lsn, relation, size, "verify") for size in (33, 100)]
     for size, result in zip((33, 100), direct):
@@ -194,7 +194,7 @@ def test_grpc_get_pages_late_chunk_preflight_and_error_boundary(
     neon_env_builder: NeonEnvBuilder, neon_binpath: Path, pg_bin: PgBin
 ):
     neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={CAP}"
-    env, _, relation, lsn = setup(neon_env_builder, "perfloop_grpc_get_pages_late", FRAME_CAP)
+    env, _, relation, lsn = make_relation(neon_env_builder, "perfloop_grpc_get_pages_late", FRAME_CAP)
     env.pageserver.allowed_errors.append(r".*grpc:pageservice.*request failed with Internal:.*")
     warmup = run(pg_bin, neon_binpath, env, lsn, relation, FRAME_CAP, "frame")
     preflight = run(pg_bin, neon_binpath, env, lsn, relation, FRAME_CAP, "frame")
