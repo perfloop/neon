@@ -73,7 +73,6 @@ impl Value {
         ])
     }
 
-    #[allow(dead_code)]
     fn is_offset(self) -> bool {
         self.0[0] & 0x80 != 0
     }
@@ -107,6 +106,9 @@ pub enum DiskBtreeError {
 
     #[error("IoError: {0}")]
     Io(#[from] io::Error),
+
+    #[error("corrupt on-disk B-tree: {0}")]
+    Corruption(String),
 }
 
 pub type Result<T> = result::Result<T, DiskBtreeError>;
@@ -131,6 +133,8 @@ impl<const L: usize> OnDiskNode<'_, L> {
     ///
     /// Interpret a PAGE_SZ page as a node.
     ///
+    /// Fast decoder used by the existing non-caching reader. The cache-enabled
+    /// walker uses `deparse_checked` before retaining or revisiting a page.
     fn deparse(buf: &[u8]) -> Result<OnDiskNode<L>> {
         let mut cursor = std::io::Cursor::new(buf);
         let num_children = cursor.read_u16::<BE>()?;
@@ -153,6 +157,58 @@ impl<const L: usize> OnDiskNode<'_, L> {
         let prefix = &buf[prefix_off..prefix_off + prefix_len as usize];
         let keys = &buf[keys_off..keys_off + keys_len];
         let values = &buf[values_off..values_off + values_len];
+
+        Ok(OnDiskNode {
+            num_children,
+            level,
+            prefix_len,
+            suffix_len,
+            prefix,
+            keys,
+            values,
+        })
+    }
+
+    fn deparse_checked(buf: &[u8]) -> Result<OnDiskNode<L>> {
+        let mut cursor = std::io::Cursor::new(buf);
+        let num_children = cursor.read_u16::<BE>()?;
+        let level = cursor.read_u8()?;
+        let prefix_len = cursor.read_u8()?;
+        let suffix_len = cursor.read_u8()?;
+
+        if num_children == 0 {
+            return Err(DiskBtreeError::Corruption("node has no children".into()));
+        }
+
+        let prefix_off = cursor.position() as usize;
+        let prefix_end = prefix_off
+            .checked_add(prefix_len as usize)
+            .ok_or_else(|| DiskBtreeError::Corruption("prefix length overflows".into()))?;
+        let keys_off = prefix_end;
+        let keys_len = num_children as usize * suffix_len as usize;
+        let keys_end = keys_off
+            .checked_add(keys_len)
+            .ok_or_else(|| DiskBtreeError::Corruption("key length overflows".into()))?;
+        let values_off = keys_end;
+        let values_len = num_children as usize * VALUE_SZ;
+        let values_end = values_off
+            .checked_add(values_len)
+            .ok_or_else(|| DiskBtreeError::Corruption("value length overflows".into()))?;
+        if values_end > buf.len() {
+            return Err(DiskBtreeError::Corruption(
+                "node fields exceed its page".into(),
+            ));
+        }
+        if prefix_len as usize + suffix_len as usize != L {
+            return Err(DiskBtreeError::Corruption(format!(
+                "node key width {} does not match expected width {L}",
+                prefix_len as usize + suffix_len as usize
+            )));
+        }
+
+        let prefix = &buf[prefix_off..prefix_end];
+        let keys = &buf[keys_off..keys_end];
+        let values = &buf[values_off..values_end];
 
         Ok(OnDiskNode {
             num_children,
@@ -267,13 +323,14 @@ where
 
     /// Create a walker for ordered range seeks over this immutable tree.
     ///
-    /// The walker retains one recently used node at every tree level. Adjacent
-    /// seeks can therefore reuse their shared root, internal nodes, and leaf
-    /// instead of rereading a root-to-leaf path for every range.
+    /// The walker retains a bounded subset of recently used path nodes. Adjacent
+    /// seeks can therefore reuse their shared root and nearby nodes instead of
+    /// rereading a root-to-leaf path for every range.
     pub(crate) fn into_range_walker(self) -> DiskBtreeRangeWalker<R, L> {
         DiskBtreeRangeWalker {
             reader: self,
             path_cache: DiskBtreePathCache::default(),
+            reusable_buf: None,
         }
     }
 
@@ -532,14 +589,26 @@ where
     }
 }
 
-// Keep request-local retained index pages bounded independently of on-disk
-// level values. Eight 8 KiB pages cap this cache at 64 KiB while retaining the
-// full path for the shallow trees expected in normal delta layers.
-const MAX_CACHED_BTREE_NODES: usize = 8;
+// The measured planner fixture reuses a root and leaf page. Keep exactly that
+// much cached state, plus one reusable scratch page for cache misses, independent
+// of untrusted on-disk levels. The walker therefore owns at most 24 KiB of pages.
+const MAX_CACHED_BTREE_NODES: usize = 2;
 
-#[derive(Default)]
+// A page-oriented B-tree needs no deep call stack in normal operation. Bound
+// this independently of the encoded level byte so corrupt cyclic or tall input
+// cannot grow the traversal stack or defer cancellation indefinitely.
+const MAX_BTREE_TRAVERSAL_DEPTH: usize = 64;
+
 struct DiskBtreePathCache {
     nodes: Vec<CachedBtreeNode>,
+}
+
+impl Default for DiskBtreePathCache {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::with_capacity(MAX_CACHED_BTREE_NODES),
+        }
+    }
 }
 
 struct CachedBtreeNode {
@@ -556,15 +625,22 @@ impl DiskBtreePathCache {
             .map(|index| self.nodes.swap_remove(index))
     }
 
-    fn insert(&mut self, block: u32, level: u8, buf: Box<[u8; PAGE_SZ]>) {
+    /// Insert a page and return a displaced buffer for reuse by the current
+    /// traversal. Once an eviction has filled the scratch slot, later cache
+    /// misses exchange page buffers rather than allocate.
+    fn insert(
+        &mut self,
+        block: u32,
+        level: u8,
+        buf: Box<[u8; PAGE_SZ]>,
+    ) -> Option<Box<[u8; PAGE_SZ]>> {
         let cached = CachedBtreeNode { block, level, buf };
         if let Some(previous) = self
             .nodes
             .iter_mut()
             .find(|previous| previous.level == level)
         {
-            *previous = cached;
-            return;
+            return Some(std::mem::replace(previous, cached).buf);
         }
 
         if self.nodes.len() == MAX_CACHED_BTREE_NODES {
@@ -578,9 +654,12 @@ impl DiskBtreePathCache {
                 .min_by_key(|(_, cached)| cached.level)
                 .expect("a full cache has a node")
                 .0;
-            self.nodes.swap_remove(evict);
+            let evicted = self.nodes.swap_remove(evict);
+            self.nodes.push(cached);
+            return Some(evicted.buf);
         }
         self.nodes.push(cached);
+        None
     }
 }
 
@@ -591,6 +670,7 @@ where
 {
     reader: DiskBtreeReader<R, L>,
     path_cache: DiskBtreePathCache,
+    reusable_buf: Option<Box<[u8; PAGE_SZ]>>,
 }
 
 impl<R, const L: usize> DiskBtreeRangeWalker<R, L>
@@ -612,31 +692,41 @@ where
         V: FnMut(&[u8], u64) -> bool,
     {
         let mut stack = Vec::new();
-        stack.push((self.reader.root_blk, None));
+        stack.push((self.reader.root_blk, None, None, 0usize));
         let block_cursor = self.reader.reader.block_cursor();
-        while let Some((node_blknum, opt_iter)) = stack.pop() {
+        while let Some((node_blknum, opt_iter, parent_level, depth)) = stack.pop() {
             let node_buf = if let Some(cached) = self.path_cache.take(node_blknum) {
                 cached.buf
             } else {
-                let page_read_guard = block_cursor
-                    .read_blk(self.reader.start_blk + node_blknum, ctx)
-                    .await?;
-                let mut buf = Box::new([0_u8; PAGE_SZ]);
+                let physical_blk = self
+                    .reader
+                    .start_blk
+                    .checked_add(node_blknum)
+                    .ok_or_else(|| DiskBtreeError::Corruption("block number overflows".into()))?;
+                let page_read_guard = block_cursor.read_blk(physical_blk, ctx).await?;
+                let mut buf = self
+                    .reusable_buf
+                    .take()
+                    .unwrap_or_else(|| Box::new([0_u8; PAGE_SZ]));
                 buf.copy_from_slice(page_read_guard.as_ref());
                 buf
             };
 
             let (node_level, stopped) = {
-                let node = OnDiskNode::deparse(node_buf.as_ref())?;
+                let node = OnDiskNode::deparse_checked(node_buf.as_ref())?;
+                if let Some(parent_level) = parent_level
+                    && node.level >= parent_level
+                {
+                    return Err(DiskBtreeError::Corruption(format!(
+                        "child block {node_blknum} has level {} not below parent level {parent_level}",
+                        node.level
+                    )));
+                }
                 let node_level = node.level;
                 let prefix_len = node.prefix_len as usize;
                 let suffix_len = node.suffix_len as usize;
-
-                assert!(node.num_children > 0);
-
-                let mut keybuf = Vec::new();
-                keybuf.extend(node.prefix);
-                keybuf.resize(prefix_len + suffix_len, 0);
+                let mut keybuf = [0_u8; L];
+                keybuf[..prefix_len].copy_from_slice(node.prefix);
 
                 let mut iter: Either<Range<usize>, Rev<RangeInclusive<usize>>> =
                     if let Some(iter) = opt_iter {
@@ -645,7 +735,7 @@ where
                         // Locate the first match. Internal-node keys are lower
                         // bounds, so a non-exact internal lookup descends through
                         // the preceding child.
-                        let idx = match node.binary_search(search_key, keybuf.as_mut_slice()) {
+                        let idx = match node.binary_search(search_key, &mut keybuf) {
                             Ok(idx) => idx,
                             Err(idx) => {
                                 if node.level == 0 {
@@ -665,13 +755,28 @@ where
                     keybuf[prefix_len..].copy_from_slice(suffix);
                     let value = node.value(idx);
                     if node.level == 0 {
+                        if value.is_offset() {
+                            return Err(DiskBtreeError::Corruption(format!(
+                                "leaf block {node_blknum} contains a child pointer"
+                            )));
+                        }
                         if !visitor(&keybuf, value.to_u64()) {
                             stopped = true;
                             break;
                         }
                     } else {
-                        stack.push((node_blknum, Some(iter)));
-                        stack.push((value.to_blknum(), None));
+                        if !value.is_offset() {
+                            return Err(DiskBtreeError::Corruption(format!(
+                                "internal block {node_blknum} contains a leaf value"
+                            )));
+                        }
+                        if depth + 1 >= MAX_BTREE_TRAVERSAL_DEPTH {
+                            return Err(DiskBtreeError::Corruption(format!(
+                                "traversal exceeds {MAX_BTREE_TRAVERSAL_DEPTH} levels"
+                            )));
+                        }
+                        stack.push((node_blknum, Some(iter), parent_level, depth));
+                        stack.push((value.to_blknum(), None, Some(node.level), depth + 1));
                         break;
                     }
                 }
@@ -679,7 +784,9 @@ where
                 (node_level, stopped)
             };
 
-            self.path_cache.insert(node_blknum, node_level, node_buf);
+            if let Some(displaced) = self.path_cache.insert(node_blknum, node_level, node_buf) {
+                self.reusable_buf = Some(displaced);
+            }
             if stopped {
                 return Ok(());
             }
@@ -1132,7 +1239,7 @@ pub(crate) mod tests {
     fn path_cache_is_bounded_for_untrusted_levels() {
         let mut cache = DiskBtreePathCache::default();
         for level in 0..=u8::MAX {
-            cache.insert(level.into(), level, Box::new([0_u8; PAGE_SZ]));
+            let _ = cache.insert(level.into(), level, Box::new([0_u8; PAGE_SZ]));
             assert!(cache.nodes.len() <= MAX_CACHED_BTREE_NODES);
         }
         assert_eq!(cache.nodes.len(), MAX_CACHED_BTREE_NODES);

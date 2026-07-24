@@ -1697,17 +1697,20 @@ impl DeltaLayerIterator<'_> {
 #[cfg(test)]
 pub(crate) mod test {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     use super::*;
     use crate::DEFAULT_PG_VERSION;
     use crate::context::DownloadBehavior;
     use crate::task_mgr::TaskKind;
+    use crate::tenant::block_io::BlockWriter;
     use crate::tenant::disk_btree::tests::TestDisk;
+    use crate::tenant::disk_btree::{DiskBtreeError, VALUE_SZ};
     use crate::tenant::harness::{TIMELINE_ID, TenantHarness};
     use crate::tenant::storage_layer::{Layer, ResidentLayer};
     use crate::tenant::timeline::layer_manager::LayerManagerLockHolder;
     use crate::tenant::{TenantShard, Timeline};
-    use bytes::Bytes;
+    use bytes::{BufMut, Bytes};
     use itertools::MinMaxResult;
     use postgres_ffi::PgMajorVersion;
     use rand::prelude::{SeedableRng, StdRng};
@@ -2561,6 +2564,122 @@ pub(crate) mod test {
                 (8 * alignment, base_key.add(4), Lsn(100), false),
             ]
         );
+    }
+
+    // These pages use the normal persisted node representation. The tests pass
+    // them through plan_reads rather than fabricating walker-private state.
+    fn malformed_btree_leaf_page() -> IoBuffer {
+        let mut page = IoBufferMut::with_capacity(PAGE_SZ);
+        page.put_u16(1);
+        page.put_u8(0);
+        page.put_u8(0);
+        page.put_u8(DELTA_KEY_SIZE as u8);
+        page.put_slice(&[0; DELTA_KEY_SIZE]);
+        page.put_slice(&[0; VALUE_SZ]);
+        page.extend_with(0, PAGE_SZ - page.len());
+        page.freeze()
+    }
+
+    fn malformed_btree_internal_page(level: u8, children: &[u32]) -> IoBuffer {
+        let mut page = IoBufferMut::with_capacity(PAGE_SZ);
+        page.put_u16(children.len().try_into().expect("test child count fits"));
+        page.put_u8(level);
+        page.put_u8(0);
+        page.put_u8(DELTA_KEY_SIZE as u8);
+        for child_index in 0..children.len() {
+            let mut key = [0; DELTA_KEY_SIZE];
+            key[DELTA_KEY_SIZE - 1] = child_index
+                .try_into()
+                .expect("test child index fits in a key byte");
+            page.put_slice(&key);
+        }
+        for child in children {
+            page.put_u8(0x80);
+            page.put_u32(*child);
+        }
+        page.extend_with(0, PAGE_SZ - page.len());
+        page.freeze()
+    }
+
+    async fn malformed_index_plan_error(disk: TestDisk, root_blk: u32) -> DiskBtreeError {
+        let base_key = Key {
+            field1: 0,
+            field2: 1663,
+            field3: 12972,
+            field4: 16396,
+            field5: 0,
+            field6: 246080,
+        };
+        let ctx = RequestContext::new(TaskKind::UnitTest, DownloadBehavior::Error);
+        let keyspace = KeySpace {
+            ranges: vec![
+                base_key..base_key.next(),
+                base_key.add(2)..base_key.add(2).next(),
+                base_key.add(4)..base_key.add(4).next(),
+            ],
+        };
+        let plan = DeltaLayerInner::plan_reads(
+            &keyspace,
+            Lsn(90)..Lsn(110),
+            0,
+            DiskBtreeReader::<_, DELTA_KEY_SIZE>::new(0, root_blk, disk),
+            VectoredReadPlanner::new(crate::virtual_file::get_io_buffer_alignment()),
+            &ctx,
+        );
+        let error = tokio::time::timeout(Duration::from_secs(1), plan)
+            .await
+            .expect("corrupt index traversal must not spin")
+            .expect_err("corrupt index must be rejected");
+        error
+            .downcast::<DiskBtreeError>()
+            .expect("plan_reads should preserve the B-tree corruption error")
+    }
+
+    #[tokio::test]
+    async fn test_delta_layer_index_traversal_rejects_non_descending_child() {
+        let mut disk = TestDisk::default();
+        assert_eq!(
+            (&mut disk)
+                .write_blk(malformed_btree_internal_page(1, &[0, 0]))
+                .expect("test disk write should succeed"),
+            0
+        );
+
+        let error = malformed_index_plan_error(disk, 0).await;
+        assert!(matches!(
+            error,
+            DiskBtreeError::Corruption(message) if message.contains("not below parent level")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_delta_layer_index_traversal_rejects_excessive_depth() {
+        let mut disk = TestDisk::default();
+        // This raw 256-block single-child chain is read through the normal
+        // DiskBtreeReader path. Its levels descend correctly, so only the
+        // independent traversal-depth bound can reject it before the leaf.
+        for level in (1..=u8::MAX).rev() {
+            let block = u32::from(u8::MAX - level);
+            assert_eq!(
+                (&mut disk)
+                    .write_blk(malformed_btree_internal_page(level, &[block + 1]))
+                    .expect("test disk write should succeed"),
+                block
+            );
+        }
+        assert_eq!(
+            (&mut disk)
+                .write_blk(malformed_btree_leaf_page())
+                .expect("test disk write should succeed"),
+            u32::from(u8::MAX)
+        );
+
+        let error = malformed_index_plan_error(disk, 0).await;
+        assert!(matches!(
+            error,
+            DiskBtreeError::Corruption(message)
+                if message.contains("traversal exceeds")
+        ));
     }
 
     async fn plan_reads_with_independent_streams<Reader>(
