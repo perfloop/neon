@@ -6,12 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use draw::{LayerTraceEvent, LayerTraceFile, LayerTraceOp};
 use futures::StreamExt;
-use pageserver_api::shard::ShardIdentity;
 use rand::Rng;
 use tracing::info;
 use utils::lsn::Lsn;
 
-use crate::helpers::{PAGE_SZ, merge_delta_keys, overlaps_with};
+use crate::helpers::{merge_delta_keys, overlaps_with};
 use crate::interface;
 use crate::interface::CompactionLayer;
 
@@ -33,13 +32,6 @@ pub struct MockTimeline {
     start_lsn: Lsn,
     end_lsn: Lsn,
 
-    // Current keyspace at `end_lsn`. This is updated on every ingested record.
-    keyspace: KeySpace,
-    keyspace_requests: u64,
-
-    // historic keyspaces
-    old_keyspaces: Vec<(Lsn, KeySpace)>,
-
     // "on-disk" layers
     pub live_layers: Vec<MockLayer>,
 
@@ -58,8 +50,6 @@ pub struct MockTimeline {
     history: Vec<draw::LayerTraceEvent>,
 }
 
-type KeySpace = interface::CompactionKeySpace<Key>;
-
 pub struct MockRequestContext {}
 impl interface::CompactionRequestContext for MockRequestContext {}
 
@@ -69,16 +59,8 @@ impl interface::CompactionKey for Key {
     const MIN: Self = u64::MIN;
     const MAX: Self = u64::MAX;
 
-    fn key_range_size(key_range: &Range<Self>, _shard_identity: &ShardIdentity) -> u32 {
-        std::cmp::min(key_range.end - key_range.start, u32::MAX as u64) as u32
-    }
-
     fn next(&self) -> Self {
         self + 1
-    }
-    fn skip_some(&self) -> Self {
-        // round up to next xx
-        self + 100
     }
 }
 
@@ -153,8 +135,6 @@ pub struct MockImageLayer {
     pub deleted: Mutex<bool>,
 }
 
-impl interface::CompactionImageLayer<MockTimeline> for Arc<MockImageLayer> {}
-
 impl interface::CompactionLayer<Key> for Arc<MockImageLayer> {
     fn key_range(&self) -> &Range<Key> {
         &self.key_range
@@ -180,10 +160,6 @@ impl interface::CompactionLayer<Key> for Arc<MockImageLayer> {
 }
 
 impl MockTimeline {
-    pub fn keyspace_request_count(&self) -> u64 {
-        self.keyspace_requests
-    }
-
     pub fn new() -> Self {
         MockTimeline {
             target_file_size: 256 * 1024 * 1024,
@@ -197,10 +173,6 @@ impl MockTimeline {
             total_len: 0,
             start_lsn: Lsn(1000),
             end_lsn: Lsn(1000),
-            keyspace: KeySpace::new(),
-            keyspace_requests: 0,
-
-            old_keyspaces: vec![],
 
             live_layers: vec![],
 
@@ -214,6 +186,31 @@ impl MockTimeline {
 
             time: 0,
             history: Vec::new(),
+        }
+    }
+
+    pub fn set_tiers_per_level(&mut self, tiers_per_level: u64) {
+        assert!(tiers_per_level > 0);
+        self.tiers_per_level = tiers_per_level;
+    }
+
+    pub fn active_delta_layer_ranges(&self) -> Vec<(Range<Key>, Range<Lsn>)> {
+        self.live_layers
+            .iter()
+            .filter(|layer| !layer.is_deleted() && layer.is_delta())
+            .map(|layer| (layer.key_range().clone(), layer.lsn_range().clone()))
+            .collect()
+    }
+
+    pub fn ingest_duplicate_records(&mut self, key: Key, len: u64, count: u64) {
+        for _ in 0..count {
+            self.records.push(MockRecord {
+                lsn: self.end_lsn,
+                key,
+                len,
+            });
+            self.total_len += len;
+            self.wal_ingested += len;
         }
     }
 
@@ -305,7 +302,6 @@ impl MockTimeline {
         len: u64,
         key_range: &Range<Key>,
     ) -> anyhow::Result<()> {
-        crate::helpers::union_to_keyspace(&mut self.keyspace, vec![key_range.clone()]);
         let mut rng = rand::rng();
         for _ in 0..num_records {
             self.ingest_record(rng.random_range(key_range.clone()), len);
@@ -434,13 +430,7 @@ impl interface::CompactionJobExecutor for MockTimeline {
     type Key = Key;
     type Layer = MockLayer;
     type DeltaLayer = Arc<MockDeltaLayer>;
-    type ImageLayer = Arc<MockImageLayer>;
     type RequestContext = MockRequestContext;
-
-    fn get_shard_identity(&self) -> &ShardIdentity {
-        static IDENTITY: ShardIdentity = ShardIdentity::unsharded();
-        &IDENTITY
-    }
 
     async fn get_layers(
         &mut self,
@@ -463,29 +453,6 @@ impl interface::CompactionJobExecutor for MockTimeline {
         Ok(layers)
     }
 
-    async fn get_keyspace(
-        &mut self,
-        key_range: &Range<Self::Key>,
-        _lsn: Lsn,
-        _ctx: &Self::RequestContext,
-    ) -> anyhow::Result<interface::CompactionKeySpace<Key>> {
-        self.keyspace_requests += 1;
-        // find it in the levels
-        if self.old_keyspaces.is_empty() {
-            Ok(crate::helpers::intersect_keyspace(
-                &self.keyspace,
-                key_range,
-            ))
-        } else {
-            // not implemented
-
-            // The mock implementation only allows requesting the
-            // keyspace at the level's end LSN. That's all that the
-            // current implementation needs.
-            panic!("keyspace not available for requested lsn");
-        }
-    }
-
     async fn downcast_delta_layer(
         &self,
         layer: &MockLayer,
@@ -495,50 +462,6 @@ impl interface::CompactionJobExecutor for MockTimeline {
             MockLayer::Delta(l) => Some(l.clone()),
             MockLayer::Image(_) => None,
         })
-    }
-
-    async fn create_image(
-        &mut self,
-        lsn: Lsn,
-        key_range: &Range<Key>,
-        ctx: &MockRequestContext,
-    ) -> anyhow::Result<()> {
-        let keyspace = self.get_keyspace(key_range, lsn, ctx).await?;
-
-        let mut accum_size: u64 = 0;
-        for r in keyspace {
-            accum_size += r.end - r.start;
-        }
-
-        let new_layer = Arc::new(MockImageLayer {
-            key_range: key_range.clone(),
-            lsn_range: lsn..lsn,
-            file_size: accum_size * PAGE_SZ,
-            deleted: Mutex::new(false),
-        });
-        info!(
-            "created image layer, size {}: {}",
-            new_layer.file_size,
-            new_layer.short_id()
-        );
-        self.live_layers.push(MockLayer::Image(new_layer.clone()));
-
-        // update stats
-        self.bytes_written += new_layer.file_size;
-        self.layers_created += 1;
-
-        self.time += 1;
-        self.history.push(LayerTraceEvent {
-            time_rel: self.time,
-            op: LayerTraceOp::CreateImage,
-            file: LayerTraceFile {
-                filename: new_layer.short_id(),
-                key_range: new_layer.key_range.clone(),
-                lsn_range: new_layer.lsn_range.clone(),
-            },
-        });
-
-        Ok(())
     }
 
     async fn create_delta(
@@ -559,6 +482,29 @@ impl interface::CompactionJobExecutor for MockTimeline {
                 records.push(delta_entry);
             }
         }
+        anyhow::ensure!(
+            lsn_range.start < lsn_range.end,
+            "refusing to create an empty LSN range {}..{}",
+            lsn_range.start,
+            lsn_range.end
+        );
+        anyhow::ensure!(
+            !self.live_layers.iter().any(|layer| {
+                !layer.is_deleted()
+                    && layer.key_range() == key_range
+                    && layer.lsn_range() == lsn_range
+            }),
+            "refusing to overwrite existing layer descriptor {}..{}__{}..{}",
+            key_range.start,
+            key_range.end,
+            lsn_range.start,
+            lsn_range.end
+        );
+        anyhow::ensure!(
+            !records.is_empty(),
+            "refusing to create a delta layer with no records"
+        );
+
         let total_records = records.len();
         let new_layer = Arc::new(MockDeltaLayer {
             key_range: key_range.clone(),

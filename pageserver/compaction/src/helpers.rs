@@ -9,27 +9,12 @@ use std::task::{Poll, ready};
 
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt};
-use itertools::Itertools;
-use pageserver_api::shard::ShardIdentity;
 use pin_project_lite::pin_project;
 use utils::lsn::Lsn;
 
 use crate::interface::*;
 
 pub const PAGE_SZ: u64 = 8192;
-
-pub fn keyspace_total_size<K>(
-    keyspace: &CompactionKeySpace<K>,
-    shard_identity: &ShardIdentity,
-) -> u64
-where
-    K: CompactionKey,
-{
-    keyspace
-        .iter()
-        .map(|r| K::key_range_size(r, shard_identity) as u64)
-        .sum()
-}
 
 pub fn overlaps_with<T: Ord>(a: &Range<T>, b: &Range<T>) -> bool {
     !(a.end <= b.start || b.end <= a.start)
@@ -42,56 +27,6 @@ pub fn overlaps_with<T: Ord>(a: &Range<T>, b: &Range<T>) -> bool {
 /// ```
 pub fn fully_contains<T: Ord>(a: &Range<T>, b: &Range<T>) -> bool {
     a.start <= b.start && a.end >= b.end
-}
-
-pub fn union_to_keyspace<K: Ord>(a: &mut CompactionKeySpace<K>, b: CompactionKeySpace<K>) {
-    let x = std::mem::take(a);
-    let mut all_ranges_iter = [x.into_iter(), b.into_iter()]
-        .into_iter()
-        .kmerge_by(|a, b| a.start < b.start);
-    let mut ranges = Vec::new();
-    if let Some(first) = all_ranges_iter.next() {
-        let (mut start, mut end) = (first.start, first.end);
-
-        for r in all_ranges_iter {
-            assert!(r.start >= start);
-            if r.start > end {
-                ranges.push(start..end);
-                start = r.start;
-                end = r.end;
-            } else if r.end > end {
-                end = r.end;
-            }
-        }
-        ranges.push(start..end);
-    }
-    *a = ranges
-}
-
-pub fn intersect_keyspace<K: Ord + Clone + Copy>(
-    a: &CompactionKeySpace<K>,
-    r: &Range<K>,
-) -> CompactionKeySpace<K> {
-    let mut ranges: Vec<Range<K>> = Vec::new();
-
-    for x in a.iter() {
-        if x.end <= r.start {
-            continue;
-        }
-        if x.start >= r.end {
-            break;
-        }
-        ranges.push(x.clone())
-    }
-
-    // trim the ends
-    if let Some(first) = ranges.first_mut() {
-        first.start = std::cmp::max(first.start, r.start);
-    }
-    if let Some(last) = ranges.last_mut() {
-        last.end = std::cmp::min(last.end, r.end);
-    }
-    ranges
 }
 
 /// Create a stream that iterates through all DeltaEntrys among all input
@@ -273,12 +208,19 @@ where
                 partition_lsns: Vec::new(),
             };
             let mut last_key = accum.key;
+            let mut last_partition_lsn = None;
             while let Some(this) = input.next().await {
                 let this = this?;
                 if this.key() == accum.key {
                     let add_size = this.size();
-                    if part_size + add_size > target_size {
+                    // Delta-layer boundaries are LSN-exclusive. Do not split
+                    // between duplicate values at the same LSN: that would
+                    // emit a zero-width range that cannot have an output layer.
+                    if part_size + add_size > target_size
+                        && last_partition_lsn != Some(this.lsn())
+                    {
                         accum.partition_lsns.push((this.lsn(), part_size));
+                        last_partition_lsn = Some(this.lsn());
                         part_size = 0;
                     }
                     part_size += add_size;
@@ -289,6 +231,7 @@ where
                     last_key = accum.key;
                     yield accum;
                     part_size = this.size();
+                    last_partition_lsn = None;
                     accum = KeySize {
                         key: this.key(),
                         num_values: 1,

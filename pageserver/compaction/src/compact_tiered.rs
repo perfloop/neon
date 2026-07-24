@@ -429,9 +429,11 @@ where
             }
         }
         // Open stream
+        let job_lsn_range = job.lsn_range.clone();
         let key_value_stream = std::pin::pin!(
             merge_delta_keys_buffered::<E>(deltas.as_slice(), ctx)
                 .await?
+                .filter(move |entry| futures::future::ready(job_lsn_range.contains(&entry.lsn())))
                 .map(Result::<_, anyhow::Error>::Ok)
         );
         let mut new_jobs = Vec::new();
@@ -451,7 +453,9 @@ where
                 .input_layers
                 .iter()
                 .filter(|layer_id| {
-                    overlaps_with(self.layers[layer_id.0].layer.key_range(), &key_range)
+                    let layer = &self.layers[layer_id.0].layer;
+                    overlaps_with(layer.key_range(), &key_range)
+                        && overlaps_with(layer.lsn_range(), &lsn_range)
                 })
                 .cloned()
                 .collect();
@@ -514,15 +518,20 @@ where
                     window = Window::new();
 
                     let mut prior_lsn = job.lsn_range.start;
-                    let mut lsn_ranges = Vec::new();
                     for (lsn, _size) in next_key.partition_lsns.iter() {
-                        lsn_ranges.push(prior_lsn..*lsn);
+                        // Multiple retained versions can have the same LSN. They
+                        // cannot form a nonempty LSN rectangle between them, so
+                        // keep them in the same output layer.
+                        if *lsn <= prior_lsn {
+                            continue;
+                        }
+                        let key_range = key..key.next();
+                        create_delta_job(key_range, &(prior_lsn..*lsn), &mut new_jobs);
                         prior_lsn = *lsn;
                     }
-                    lsn_ranges.push(prior_lsn..job.lsn_range.end);
-                    for lsn_range in lsn_ranges {
+                    if prior_lsn < job.lsn_range.end {
                         let key_range = key..key.next();
-                        create_delta_job(key_range, &lsn_range, &mut new_jobs);
+                        create_delta_job(key_range, &(prior_lsn..job.lsn_range.end), &mut new_jobs);
                     }
                 }
             }

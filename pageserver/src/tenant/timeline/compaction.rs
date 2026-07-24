@@ -29,9 +29,9 @@ use itertools::Itertools;
 use once_cell::sync::Lazy;
 use pageserver_api::config::tenant_conf_defaults::DEFAULT_CHECKPOINT_DISTANCE;
 use pageserver_api::key::{KEY_SIZE, Key};
-use pageserver_api::keyspace::{KeySpace, ShardedRange};
+use pageserver_api::keyspace::ShardedRange;
 use pageserver_api::models::{CompactInfoResponse, CompactKeyRange};
-use pageserver_api::shard::{ShardCount, ShardIdentity, TenantShardId};
+use pageserver_api::shard::{ShardCount, TenantShardId};
 use pageserver_compaction::helpers::{fully_contains, overlaps_with};
 use pageserver_compaction::interface::*;
 use serde::Serialize;
@@ -63,8 +63,7 @@ use crate::tenant::storage_layer::{
 };
 use crate::tenant::tasks::log_compaction_error;
 use crate::tenant::timeline::{
-    DeltaLayerWriter, ImageLayerCreationOutcome, ImageLayerWriter, IoConcurrency, Layer,
-    ResidentLayer, drop_layer_manager_rlock,
+    DeltaLayerWriter, ImageLayerWriter, Layer, ResidentLayer, drop_layer_manager_rlock,
 };
 use crate::tenant::{DeltaLayer, MaybeOffloaded, PageReconstructError};
 use crate::virtual_file::{MaybeFatalIo, VirtualFile};
@@ -4192,12 +4191,7 @@ impl Timeline {
 struct TimelineAdaptor {
     timeline: Arc<Timeline>,
 
-    // Image materialization needs a reconstructed keyspace, but delta retiling
-    // does not. Populate this only if an image job explicitly asks for it.
-    keyspace: Option<(Lsn, KeySpace)>,
-
     new_deltas: Vec<ResidentLayer>,
-    new_images: Vec<ResidentLayer>,
     layers_to_delete: Vec<Arc<PersistentLayerDesc>>,
 }
 
@@ -4205,8 +4199,6 @@ impl TimelineAdaptor {
     pub fn new(timeline: &Arc<Timeline>) -> Self {
         Self {
             timeline: timeline.clone(),
-            keyspace: None,
-            new_images: Vec::new(),
             new_deltas: Vec::new(),
             layers_to_delete: Vec::new(),
         }
@@ -4225,11 +4217,8 @@ impl TimelineAdaptor {
                 .collect::<Vec<Layer>>()
         };
         self.timeline
-            .finish_compact_batch(&self.new_deltas, &self.new_images, &layers_to_delete)
+            .finish_compact_batch(&self.new_deltas, &[], &layers_to_delete)
             .await?;
-
-        self.timeline
-            .upload_new_image_layers(std::mem::take(&mut self.new_images))?;
 
         self.new_deltas.clear();
         self.layers_to_delete.clear();
@@ -4239,21 +4228,14 @@ impl TimelineAdaptor {
 
 #[derive(Clone)]
 struct ResidentDeltaLayer(ResidentLayer);
-#[derive(Clone)]
-struct ResidentImageLayer(ResidentLayer);
 
 impl CompactionJobExecutor for TimelineAdaptor {
     type Key = pageserver_api::key::Key;
 
     type Layer = OwnArc<PersistentLayerDesc>;
     type DeltaLayer = ResidentDeltaLayer;
-    type ImageLayer = ResidentImageLayer;
 
     type RequestContext = crate::context::RequestContext;
-
-    fn get_shard_identity(&self) -> &ShardIdentity {
-        self.timeline.get_shard_identity()
-    }
 
     async fn get_layers(
         &mut self,
@@ -4280,34 +4262,6 @@ impl CompactionJobExecutor for TimelineAdaptor {
         Ok(result)
     }
 
-    async fn get_keyspace(
-        &mut self,
-        key_range: &Range<Key>,
-        lsn: Lsn,
-        ctx: &RequestContext,
-    ) -> anyhow::Result<Vec<Range<Key>>> {
-        if let Some((cached_lsn, keyspace)) = &self.keyspace {
-            if lsn != *cached_lsn {
-                // The current image implementation only requests the keyspace at
-                // the compaction end LSN. Keep that invariant when it becomes
-                // reachable again.
-                anyhow::bail!("keyspace not available for requested lsn");
-            }
-            return Ok(pageserver_compaction::helpers::intersect_keyspace(
-                &keyspace.ranges,
-                key_range,
-            ));
-        }
-
-        let (dense_keyspace, _sparse_keyspace) = self.timeline.collect_keyspace(lsn, ctx).await?;
-        self.keyspace = Some((lsn, dense_keyspace));
-        let (_, keyspace) = self.keyspace.as_ref().expect("keyspace was just populated");
-        Ok(pageserver_compaction::helpers::intersect_keyspace(
-            &keyspace.ranges,
-            key_range,
-        ))
-    }
-
     async fn downcast_delta_layer(
         &self,
         layer: &OwnArc<PersistentLayerDesc>,
@@ -4329,15 +4283,6 @@ impl CompactionJobExecutor for TimelineAdaptor {
         } else {
             Ok(None)
         }
-    }
-
-    async fn create_image(
-        &mut self,
-        lsn: Lsn,
-        key_range: &Range<Key>,
-        ctx: &RequestContext,
-    ) -> anyhow::Result<()> {
-        Ok(self.create_image_impl(lsn, key_range, ctx).await?)
     }
 
     async fn create_delta(
@@ -4415,7 +4360,10 @@ impl CompactionJobExecutor for TimelineAdaptor {
             ))
         });
 
-        let (desc, path) = writer.finish(prev.unwrap().0.next(), ctx).await?;
+        let last_key = prev
+            .ok_or_else(|| anyhow!("tiered delta job had no entries in its LSN-key rectangle"))?
+            .0;
+        let (desc, path) = writer.finish(last_key.next(), ctx).await?;
         let new_delta_layer =
             Layer::finish_creating(self.timeline.conf, &self.timeline, desc, &path)?;
 
@@ -4429,74 +4377,6 @@ impl CompactionJobExecutor for TimelineAdaptor {
         _ctx: &RequestContext,
     ) -> anyhow::Result<()> {
         self.layers_to_delete.push(layer.clone().0);
-        Ok(())
-    }
-}
-
-impl TimelineAdaptor {
-    async fn create_image_impl(
-        &mut self,
-        lsn: Lsn,
-        key_range: &Range<Key>,
-        ctx: &RequestContext,
-    ) -> Result<(), CreateImageLayersError> {
-        let timer = self.timeline.metrics.create_images_time_histo.start_timer();
-
-        let image_layer_writer = ImageLayerWriter::new(
-            self.timeline.conf,
-            self.timeline.timeline_id,
-            self.timeline.tenant_shard_id,
-            key_range,
-            lsn,
-            &self.timeline.gate,
-            self.timeline.cancel.clone(),
-            ctx,
-        )
-        .await
-        .map_err(CreateImageLayersError::Other)?;
-
-        fail_point!("image-layer-writer-fail-before-finish", |_| {
-            Err(CreateImageLayersError::Other(anyhow::anyhow!(
-                "failpoint image-layer-writer-fail-before-finish"
-            )))
-        });
-
-        let keyspace = KeySpace {
-            ranges: self
-                .get_keyspace(key_range, lsn, ctx)
-                .await
-                .map_err(CreateImageLayersError::Other)?,
-        };
-        // TODO set proper (stateful) start. The create_image_layer_for_rel_blocks function mostly
-        let outcome = self
-            .timeline
-            .create_image_layer_for_rel_blocks(
-                &keyspace,
-                image_layer_writer,
-                lsn,
-                ctx,
-                key_range.clone(),
-                IoConcurrency::sequential(),
-                None,
-            )
-            .await?;
-
-        if let ImageLayerCreationOutcome::Generated {
-            unfinished_image_layer,
-        } = outcome
-        {
-            let (desc, path) = unfinished_image_layer
-                .finish(ctx)
-                .await
-                .map_err(CreateImageLayersError::Other)?;
-            let image_layer =
-                Layer::finish_creating(self.timeline.conf, &self.timeline, desc, &path)
-                    .map_err(CreateImageLayersError::Other)?;
-            self.new_images.push(image_layer);
-        }
-
-        timer.stop_and_record();
-
         Ok(())
     }
 }
@@ -4580,22 +4460,3 @@ impl CompactionDeltaLayer<TimelineAdaptor> for ResidentDeltaLayer {
         self.0.get_as_delta(ctx).await?.index_entries(ctx).await
     }
 }
-
-impl CompactionLayer<Key> for ResidentImageLayer {
-    fn key_range(&self) -> &Range<Key> {
-        &self.0.layer_desc().key_range
-    }
-    fn lsn_range(&self) -> &Range<Lsn> {
-        &self.0.layer_desc().lsn_range
-    }
-    fn file_size(&self) -> u64 {
-        self.0.layer_desc().file_size
-    }
-    fn short_id(&self) -> std::string::String {
-        self.0.layer_desc().short_id().to_string()
-    }
-    fn is_delta(&self) -> bool {
-        false
-    }
-}
-impl CompactionImageLayer<TimelineAdaptor> for ResidentImageLayer {}

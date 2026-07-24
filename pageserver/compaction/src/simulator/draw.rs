@@ -53,7 +53,6 @@ impl<T: Ord + Copy> CoordinateMap<T> {
 pub enum LayerTraceOp {
     Flush,
     CreateDelta,
-    CreateImage,
     Delete,
 }
 
@@ -62,7 +61,6 @@ impl std::fmt::Display for LayerTraceOp {
         let op_str = match self {
             LayerTraceOp::Flush => "flush",
             LayerTraceOp::CreateDelta => "create_delta",
-            LayerTraceOp::CreateImage => "create_image",
             LayerTraceOp::Delete => "delete",
         };
         f.write_str(op_str)
