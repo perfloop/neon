@@ -98,9 +98,19 @@ def build() -> None:
     make_env = env | {
         "BUILD_TYPE": "release",
         "CARGO_BUILD_FLAGS": "--features=testing",
-        "NEON_CARGO_ARTIFACT_TARGET_DIR": str(target_dir / "release"),
     }
-    run(["make", "-s", "-j8", "neon"], env=make_env)
+    # The repository Makefile assigns this variable itself, so pass the Cargo
+    # launcher's worktree-keyed artifact directory as a command-line override.
+    run(
+        [
+            "make",
+            "-s",
+            "-j8",
+            f"NEON_CARGO_ARTIFACT_TARGET_DIR={target_dir / 'release'}",
+            "neon",
+        ],
+        env=make_env,
+    )
 
 
 def require_runtime(env: dict[str, str]) -> tuple[Path, Path]:
