@@ -11,6 +11,7 @@ from fixtures.log_helper import log
 from fixtures.neon_fixtures import wait_for_last_flush_lsn
 
 if TYPE_CHECKING:
+    from fixtures.common_types import Lsn
     from fixtures.neon_fixtures import NeonEnv, NeonEnvBuilder, PgBin
 
 
@@ -37,7 +38,7 @@ def run_frame(
     pg_bin: PgBin,
     neon_binpath: Path,
     env: NeonEnv,
-    read_lsn: str,
+    read_lsn: Lsn,
     relation: tuple[int, int, int],
     mode: str,
     frame_size: int | None = None,
@@ -85,9 +86,7 @@ def test_grpc_get_pages_frame_boundaries(
     # With 129 blocks, every child request is locally at or below the 32-key cap,
     # so only an aggregate check before GetPageSplitter can reject the wire frame.
     neon_env_builder.num_pageservers = 1
-    neon_env_builder.pageserver_config_override = (
-        f"max_get_vectored_keys={MAX_GET_VECTORED_KEYS}"
-    )
+    neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={MAX_GET_VECTORED_KEYS}"
     env = neon_env_builder.init_start(
         initial_tenant_shard_count=1,
         initial_tenant_shard_stripe_size=1,

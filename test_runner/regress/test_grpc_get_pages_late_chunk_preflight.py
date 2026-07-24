@@ -9,6 +9,7 @@ from fixtures.log_helper import log
 from fixtures.neon_fixtures import wait_for_last_flush_lsn
 
 if TYPE_CHECKING:
+    from fixtures.common_types import Lsn
     from fixtures.neon_fixtures import NeonEnv, NeonEnvBuilder, PgBin
 
 
@@ -22,7 +23,7 @@ def run_late_chunk_preflight(
     pg_bin: PgBin,
     neon_binpath: Path,
     env: NeonEnv,
-    read_lsn: str,
+    read_lsn: Lsn,
     relation: tuple[int, int, int],
     mode: str,
 ) -> dict[str, Any]:
