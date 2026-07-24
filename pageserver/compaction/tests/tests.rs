@@ -72,6 +72,14 @@ async fn test_same_lsn_values_do_not_create_empty_delta_ranges() {
             key_range == &(0..1) && lsn_range.start < lsn_range.end
         })
     );
+    let expected_record_count = 9;
+    assert_eq!(executor.active_delta_record_count(), expected_record_count);
+
+    // A later compaction sees the published output state. It must neither emit
+    // a colliding descriptor nor lose the retained duplicate records.
+    executor.compact().await.unwrap();
+    assert_eq!(executor.active_delta_layer_ranges(), output_ranges);
+    assert_eq!(executor.active_delta_record_count(), expected_record_count);
 }
 
 /// Fanout one promotes every L0 tier, but an upper tier with depth one must not

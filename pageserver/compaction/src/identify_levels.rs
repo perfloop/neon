@@ -250,30 +250,52 @@ impl<L> Level<L> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
-    use crate::simulator::{Key, MockDeltaLayer, MockImageLayer, MockLayer};
+    use crate::simulator::Key;
 
-    fn delta(key_range: Range<Key>, lsn_range: Range<Lsn>) -> MockLayer {
-        MockLayer::Delta(Arc::new(MockDeltaLayer {
-            key_range,
-            lsn_range,
-            // identify_level() doesn't pay attention to the rest of the fields
-            file_size: 0,
-            deleted: Mutex::new(false),
-            records: vec![],
-        }))
+    #[derive(Clone)]
+    struct TestLayer {
+        key_range: Range<Key>,
+        lsn_range: Range<Lsn>,
+        is_delta: bool,
     }
 
-    fn image(key_range: Range<Key>, lsn: Lsn) -> MockLayer {
-        MockLayer::Image(Arc::new(MockImageLayer {
+    impl CompactionLayer<Key> for TestLayer {
+        fn key_range(&self) -> &Range<Key> {
+            &self.key_range
+        }
+
+        fn lsn_range(&self) -> &Range<Lsn> {
+            &self.lsn_range
+        }
+
+        fn file_size(&self) -> u64 {
+            0
+        }
+
+        fn short_id(&self) -> String {
+            "test layer".to_string()
+        }
+
+        fn is_delta(&self) -> bool {
+            self.is_delta
+        }
+    }
+
+    fn delta(key_range: Range<Key>, lsn_range: Range<Lsn>) -> TestLayer {
+        TestLayer {
+            key_range,
+            lsn_range,
+            is_delta: true,
+        }
+    }
+
+    fn image(key_range: Range<Key>, lsn: Lsn) -> TestLayer {
+        TestLayer {
             key_range,
             lsn_range: lsn..(lsn + 1),
-            // identify_level() doesn't pay attention to the rest of the fields
-            file_size: 0,
-            deleted: Mutex::new(false),
-        }))
+            is_delta: false,
+        }
     }
 
     #[tokio::test]
@@ -366,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_depth_images() -> anyhow::Result<()> {
-        let layers: Vec<MockLayer> = vec![
+        let layers = vec![
             delta(1000..2000, Lsn(0x8000)..Lsn(0x9000)),
             delta(1500..2500, Lsn(0x7000)..Lsn(0x8000)),
             delta(2000..3000, Lsn(0x6000)..Lsn(0x7000)),

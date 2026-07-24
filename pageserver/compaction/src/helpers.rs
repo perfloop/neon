@@ -208,19 +208,12 @@ where
                 partition_lsns: Vec::new(),
             };
             let mut last_key = accum.key;
-            let mut last_partition_lsn = None;
             while let Some(this) = input.next().await {
                 let this = this?;
                 if this.key() == accum.key {
                     let add_size = this.size();
-                    // Delta-layer boundaries are LSN-exclusive. Do not split
-                    // between duplicate values at the same LSN: that would
-                    // emit a zero-width range that cannot have an output layer.
-                    if part_size + add_size > target_size
-                        && last_partition_lsn != Some(this.lsn())
-                    {
+                    if part_size + add_size > target_size {
                         accum.partition_lsns.push((this.lsn(), part_size));
-                        last_partition_lsn = Some(this.lsn());
                         part_size = 0;
                     }
                     part_size += add_size;
@@ -231,7 +224,6 @@ where
                     last_key = accum.key;
                     yield accum;
                     part_size = this.size();
-                    last_partition_lsn = None;
                     accum = KeySize {
                         key: this.key(),
                         num_values: 1,

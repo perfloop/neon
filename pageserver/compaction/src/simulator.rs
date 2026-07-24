@@ -33,7 +33,7 @@ pub struct MockTimeline {
     end_lsn: Lsn,
 
     // "on-disk" layers
-    pub live_layers: Vec<MockLayer>,
+    pub live_layers: Vec<Arc<MockDeltaLayer>>,
 
     num_deleted_layers: u64,
 
@@ -126,39 +126,6 @@ impl interface::CompactionDeltaLayer<MockTimeline> for Arc<MockDeltaLayer> {
     }
 }
 
-pub struct MockImageLayer {
-    pub key_range: Range<Key>,
-    pub lsn_range: Range<Lsn>,
-
-    pub file_size: u64,
-
-    pub deleted: Mutex<bool>,
-}
-
-impl interface::CompactionLayer<Key> for Arc<MockImageLayer> {
-    fn key_range(&self) -> &Range<Key> {
-        &self.key_range
-    }
-    fn lsn_range(&self) -> &Range<Lsn> {
-        &self.lsn_range
-    }
-
-    fn file_size(&self) -> u64 {
-        self.file_size
-    }
-
-    fn short_id(&self) -> String {
-        format!(
-            "{:016X}-{:016X}__{:08X}",
-            self.key_range.start, self.key_range.end, self.lsn_range.start.0,
-        )
-    }
-
-    fn is_delta(&self) -> bool {
-        false
-    }
-}
-
 impl MockTimeline {
     pub fn new() -> Self {
         MockTimeline {
@@ -197,9 +164,17 @@ impl MockTimeline {
     pub fn active_delta_layer_ranges(&self) -> Vec<(Range<Key>, Range<Lsn>)> {
         self.live_layers
             .iter()
-            .filter(|layer| !layer.is_deleted() && layer.is_delta())
+            .filter(|layer| !layer.is_deleted())
             .map(|layer| (layer.key_range().clone(), layer.lsn_range().clone()))
             .collect()
+    }
+
+    pub fn active_delta_record_count(&self) -> usize {
+        self.live_layers
+            .iter()
+            .filter(|layer| !layer.is_deleted())
+            .map(|layer| layer.records.len())
+            .sum()
     }
 
     pub fn ingest_duplicate_records(&mut self, key: Key, len: u64, count: u64) {
@@ -269,7 +244,7 @@ impl MockTimeline {
             deleted: Mutex::new(false),
         });
         info!("flushed L0 layer {}", new_layer.short_id());
-        self.live_layers.push(MockLayer::from(&new_layer));
+        self.live_layers.push(new_layer.clone());
 
         // reset L0
         self.start_lsn = self.end_lsn;
@@ -356,79 +331,21 @@ impl Default for MockTimeline {
     }
 }
 
-#[derive(Clone)]
-pub enum MockLayer {
-    Delta(Arc<MockDeltaLayer>),
-    Image(Arc<MockImageLayer>),
-}
-
-impl interface::CompactionLayer<Key> for MockLayer {
-    fn key_range(&self) -> &Range<Key> {
-        match self {
-            MockLayer::Delta(this) => this.key_range(),
-            MockLayer::Image(this) => this.key_range(),
-        }
-    }
-    fn lsn_range(&self) -> &Range<Lsn> {
-        match self {
-            MockLayer::Delta(this) => this.lsn_range(),
-            MockLayer::Image(this) => this.lsn_range(),
-        }
-    }
-    fn file_size(&self) -> u64 {
-        match self {
-            MockLayer::Delta(this) => this.file_size,
-            MockLayer::Image(this) => this.file_size,
-        }
-    }
-    fn short_id(&self) -> String {
-        match self {
-            MockLayer::Delta(this) => this.short_id(),
-            MockLayer::Image(this) => this.short_id(),
-        }
-    }
-
-    fn is_delta(&self) -> bool {
-        match self {
-            MockLayer::Delta(_) => true,
-            MockLayer::Image(_) => false,
-        }
-    }
-}
-
-impl MockLayer {
+impl MockDeltaLayer {
     fn is_deleted(&self) -> bool {
-        let guard = match self {
-            MockLayer::Delta(this) => this.deleted.lock().unwrap(),
-            MockLayer::Image(this) => this.deleted.lock().unwrap(),
-        };
-        *guard
+        *self.deleted.lock().unwrap()
     }
+
     fn mark_deleted(&self) {
-        let mut deleted_guard = match self {
-            MockLayer::Delta(this) => this.deleted.lock().unwrap(),
-            MockLayer::Image(this) => this.deleted.lock().unwrap(),
-        };
-        assert!(!*deleted_guard, "layer already deleted");
-        *deleted_guard = true;
-    }
-}
-
-impl From<&Arc<MockDeltaLayer>> for MockLayer {
-    fn from(l: &Arc<MockDeltaLayer>) -> Self {
-        MockLayer::Delta(l.clone())
-    }
-}
-
-impl From<&Arc<MockImageLayer>> for MockLayer {
-    fn from(l: &Arc<MockImageLayer>) -> Self {
-        MockLayer::Image(l.clone())
+        let mut deleted = self.deleted.lock().unwrap();
+        assert!(!*deleted, "layer already deleted");
+        *deleted = true;
     }
 }
 
 impl interface::CompactionJobExecutor for MockTimeline {
     type Key = Key;
-    type Layer = MockLayer;
+    type Layer = Arc<MockDeltaLayer>;
     type DeltaLayer = Arc<MockDeltaLayer>;
     type RequestContext = MockRequestContext;
 
@@ -441,7 +358,7 @@ impl interface::CompactionJobExecutor for MockTimeline {
         // Clear any deleted layers from our vec
         self.live_layers.retain(|l| !l.is_deleted());
 
-        let layers: Vec<MockLayer> = self
+        let layers: Vec<Arc<MockDeltaLayer>> = self
             .live_layers
             .iter()
             .filter(|l| {
@@ -455,13 +372,10 @@ impl interface::CompactionJobExecutor for MockTimeline {
 
     async fn downcast_delta_layer(
         &self,
-        layer: &MockLayer,
+        layer: &Arc<MockDeltaLayer>,
         _ctx: &MockRequestContext,
     ) -> anyhow::Result<Option<Arc<MockDeltaLayer>>> {
-        Ok(match layer {
-            MockLayer::Delta(l) => Some(l.clone()),
-            MockLayer::Image(_) => None,
-        })
+        Ok(Some(layer.clone()))
     }
 
     async fn create_delta(
@@ -519,7 +433,7 @@ impl interface::CompactionJobExecutor for MockTimeline {
             total_len,
             new_layer.short_id()
         );
-        self.live_layers.push(MockLayer::Delta(new_layer.clone()));
+        self.live_layers.push(new_layer.clone());
 
         // update stats
         self.bytes_written += total_len;
@@ -544,7 +458,6 @@ impl interface::CompactionJobExecutor for MockTimeline {
         layer: &Self::Layer,
         _ctx: &MockRequestContext,
     ) -> anyhow::Result<()> {
-        let layer = std::pin::pin!(layer);
         info!("deleting layer: {}", layer.short_id());
         self.num_deleted_layers += 1;
         self.bytes_deleted += layer.file_size();
