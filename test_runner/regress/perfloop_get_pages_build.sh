@@ -86,7 +86,7 @@ set -euo pipefail
 
 : "${TEST_OUTPUT:?TEST_OUTPUT must name a worktree-local runtime directory}"
 log="$TEST_OUTPUT/perfloop-get-pages-benchmark.log"
-if ./scripts/pytest -q -s test_runner/regress/test_grpc_get_pages_large_frames.py::test_grpc_get_pages_large_frames >"$log" 2>&1; then
+if PERFLOOP_BENCH_BIN="$PWD/target/debug/perfloop_get_pages_frame" ./scripts/pytest -q -s test_runner/regress/test_grpc_get_pages_large_frames.py::test_grpc_get_pages_large_frames >"$log" 2>&1; then
     :
 else
     status=$?
