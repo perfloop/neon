@@ -31,6 +31,10 @@ log="$log_dir/perfloop-get-pages-build.$$.log"
 
     BUILD_TYPE=debug make -j"$(nproc)" CARGO_BUILD_FLAGS='--locked --features testing,rest_broker' \
         postgres-headers-install-v14 postgres-headers-install-v15 postgres-headers-install-v17
+    # pgxn/neon links this static library from NEON_CARGO_ARTIFACT_TARGET_DIR,
+    # while its nested make invokes cargo from a subdirectory.
+    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
+        cargo build --locked -p communicator --features testing,rest_broker
     BUILD_TYPE=debug make -j"$(nproc)" CARGO_BUILD_FLAGS='--locked --features testing,rest_broker' \
         NEON_CARGO_ARTIFACT_TARGET_DIR="$CARGO_TARGET_DIR/debug" neon-pg-ext-v16
 
