@@ -83,7 +83,33 @@ log="$log_dir/perfloop-get-pages-build.$$.log"
         cat >"$PERFLOOP_BENCH_BIN" <<'PERFLOOP_RUNNER'
 #!/usr/bin/env bash
 set -euo pipefail
-exec ./scripts/pytest -q -s test_runner/regress/test_grpc_get_pages_large_frames.py::test_grpc_get_pages_large_frames
+
+: "${TEST_OUTPUT:?TEST_OUTPUT must name a worktree-local runtime directory}"
+log="$TEST_OUTPUT/perfloop-get-pages-benchmark.log"
+if ./scripts/pytest -q -s test_runner/regress/test_grpc_get_pages_large_frames.py::test_grpc_get_pages_large_frames >"$log" 2>&1; then
+    :
+else
+    status=$?
+    cat "$log" >&2
+    exit "$status"
+fi
+
+python3 - "$log" <<'PERFLOOP_JSON'
+import json
+import sys
+
+emitted = 0
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        sample = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if set(sample) == {"metric", "value"} and isinstance(sample["metric"], str):
+        print(json.dumps(sample, separators=(",", ":")))
+        emitted += 1
+if emitted == 0:
+    raise SystemExit("native GetPages test emitted no proof JSONL metrics")
+PERFLOOP_JSON
 PERFLOOP_RUNNER
         chmod +x "$PERFLOOP_BENCH_BIN"
     fi
