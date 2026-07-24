@@ -1,34 +1,19 @@
 #!/usr/bin/env bash
-# Build the isolated local artifacts required by the Perfloop GetPages probes.
-# Dependency caches are shared under /workspace/deps; all source-derived output
-# remains in this worktree.
 set -uo pipefail
 
-repo_root=$(git rev-parse --show-toplevel)
-cd "$repo_root"
-
-log_dir="$PWD/test_output"
-mkdir -p "$log_dir" /workspace/deps
-log="$log_dir/perfloop-get-pages-build.$$.log"
-
+cd "$(git rev-parse --show-toplevel)"
+mkdir -p test_output /workspace/deps
+log="$PWD/test_output/perfloop-get-pages-build.$$.log"
 (
     set -euo pipefail
-
-    export PIP_CACHE_DIR=/workspace/deps/pip
-    export POETRY_CACHE_DIR=/workspace/deps/pip/poetry
+    export PIP_CACHE_DIR=/workspace/deps/pip POETRY_CACHE_DIR=/workspace/deps/pip/poetry
     export POETRY_VIRTUALENVS_IN_PROJECT=true
-
     git submodule update --init --recursive --depth 1 --jobs 8
-    cargo_target_dir=$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
-    # The sandbox's Cargo launcher owns a worktree-keyed target directory.
-    # Tests expect NEON_BIN under ./target, so maintain only a local symlink.
+    target=$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
     if [[ -e target || -L target ]]; then
-        if [[ "$(readlink -f target)" != "$cargo_target_dir" ]]; then
-            rm -rf target
-            ln -s "$cargo_target_dir" target
-        fi
+        [[ "$(readlink -f target)" == "$target" ]] || { rm -rf target; ln -s "$target" target; }
     else
-        ln -s "$cargo_target_dir" target
+        ln -s "$target" target
     fi
     flock /workspace/deps/perfloop-poetry.lock bash -euo pipefail -c '
         if [[ ! -x /workspace/deps/perfloop-poetry/bin/poetry ]]; then
@@ -36,90 +21,47 @@ log="$log_dir/perfloop-get-pages-build.$$.log"
             /workspace/deps/perfloop-poetry/bin/python -m pip install --upgrade poetry
         fi
     '
-
     PATH=/workspace/deps/perfloop-poetry/bin:$PATH ./scripts/pysync
-
-    BUILD_TYPE=debug make -j"$(nproc)" CARGO_BUILD_FLAGS='--locked --features testing,rest_broker' \
-        postgres-headers-install-v14 postgres-headers-install-v15 postgres-headers-install-v17
-    # pgxn/neon links this static library from NEON_CARGO_ARTIFACT_TARGET_DIR,
-    # while its nested make invokes cargo from a subdirectory.
-    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
-        cargo build --locked -p communicator --features testing,rest_broker
-    BUILD_TYPE=debug make -j"$(nproc)" CARGO_BUILD_FLAGS='--locked --features testing,rest_broker' \
-        NEON_CARGO_ARTIFACT_TARGET_DIR="$cargo_target_dir/debug" neon-pg-ext-v16
-
-    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
-        cargo build --locked -p pageserver --bin pageserver --features testing
-    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
-        cargo build --locked -p safekeeper --bin safekeeper --features testing
-    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
-        cargo build --locked -p storage_controller --bin storage_controller --features testing
-    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
-        cargo build --locked -p control_plane --bin neon_local
-    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
-        cargo build --locked -p compute_tools --bin compute_ctl --features testing
-    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
-        cargo build --locked -p storage_broker --bin storage_broker
-    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
-        cargo build --locked -p endpoint_storage --bin endpoint_storage
-    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 \
-        cargo build --locked -p pagebench --bin perfloop_get_pages_frame \
-        --bin perfloop_get_pages_frame_boundaries --bin perfloop_get_pages_late_chunk_preflight
-
-    test -x "$cargo_target_dir/debug/pageserver"
-    test -x "$cargo_target_dir/debug/safekeeper"
-    test -x "$cargo_target_dir/debug/storage_controller"
-    test -x "$cargo_target_dir/debug/neon_local"
-    test -x "$cargo_target_dir/debug/compute_ctl"
-    test -x "$cargo_target_dir/debug/storage_broker"
-    test -x "$cargo_target_dir/debug/endpoint_storage"
-    test -x "$cargo_target_dir/debug/perfloop_get_pages_frame"
-    test -x "$cargo_target_dir/debug/perfloop_get_pages_frame_boundaries"
-    test -x "$cargo_target_dir/debug/perfloop_get_pages_late_chunk_preflight"
+    BUILD_TYPE=debug make -j"$(nproc)" CARGO_BUILD_FLAGS='--locked --features testing,rest_broker' postgres-headers-install-v14 postgres-headers-install-v15 postgres-headers-install-v17
+    CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 cargo build --locked -p communicator --features testing,rest_broker
+    BUILD_TYPE=debug make -j"$(nproc)" CARGO_BUILD_FLAGS='--locked --features testing,rest_broker' NEON_CARGO_ARTIFACT_TARGET_DIR="$target/debug" neon-pg-ext-v16
+    build() { CARGO_BUILD_JOBS="$(nproc)" CARGO_TERM_PROGRESS_WHEN=never CI=1 cargo build --locked "$@"; }
+    build -p pageserver --bin pageserver --features testing
+    build -p safekeeper --bin safekeeper --features testing
+    build -p storage_controller --bin storage_controller --features testing
+    build -p control_plane --bin neon_local
+    build -p compute_tools --bin compute_ctl --features testing
+    build -p storage_broker --bin storage_broker
+    build -p endpoint_storage --bin endpoint_storage
+    build -p pagebench --bin perfloop_get_pages
+    for binary in pageserver safekeeper storage_controller neon_local compute_ctl storage_broker endpoint_storage perfloop_get_pages; do
+        test -x "$target/debug/$binary"
+    done
     test -f pg_install/v16/lib/postgresql/neon.so
-
     if [[ -n "${PERFLOOP_BENCH_BIN:-}" ]]; then
         mkdir -p "$(dirname "$PERFLOOP_BENCH_BIN")"
-        cat >"$PERFLOOP_BENCH_BIN" <<'PERFLOOP_RUNNER'
+        cat >"$PERFLOOP_BENCH_BIN" <<'RUNNER'
 #!/usr/bin/env bash
 set -euo pipefail
-
 : "${TEST_OUTPUT:?TEST_OUTPUT must name a worktree-local runtime directory}"
 log="$TEST_OUTPUT/perfloop-get-pages-benchmark.log"
-if PERFLOOP_BENCH_BIN="$PWD/target/debug/perfloop_get_pages_frame" ./scripts/pytest -q -s test_runner/regress/test_grpc_get_pages_large_frames.py::test_grpc_get_pages_large_frames >"$log" 2>&1; then
-    :
-else
-    status=$?
-    cat "$log" >&2
-    exit "$status"
-fi
-
-python3 - "$log" <<'PERFLOOP_JSON'
-import json
-import sys
-
+if PERFLOOP_GET_PAGES_BIN="$PWD/target/debug/perfloop_get_pages" ./scripts/pytest -q -s test_runner/regress/test_grpc_get_pages.py::test_grpc_get_pages_large_frames >"$log" 2>&1; then :; else status=$?; cat "$log" >&2; exit "$status"; fi
+python3 - "$log" <<'JSON'
+import json, sys
 emitted = 0
 for line in open(sys.argv[1], encoding="utf-8"):
-    try:
-        sample = json.loads(line)
-    except json.JSONDecodeError:
-        continue
+    try: sample = json.loads(line)
+    except json.JSONDecodeError: continue
     if set(sample) == {"metric", "value"} and isinstance(sample["metric"], str):
         print(json.dumps(sample, separators=(",", ":")))
         emitted += 1
-if emitted == 0:
-    raise SystemExit("native GetPages test emitted no proof JSONL metrics")
-PERFLOOP_JSON
-PERFLOOP_RUNNER
+if not emitted: raise SystemExit("native GetPages test emitted no proof JSONL metrics")
+JSON
+RUNNER
         chmod +x "$PERFLOOP_BENCH_BIN"
     fi
 ) >"$log" 2>&1
 status=$?
-
-if [[ "$status" -ne 0 ]]; then
-    tail -n 200 "$log"
-    exit "$status"
-fi
-
+if [[ "$status" -ne 0 ]]; then tail -n 200 "$log"; exit "$status"; fi
 rm -f "$log"
 printf 'perfloop_get_pages_build completed\n'
