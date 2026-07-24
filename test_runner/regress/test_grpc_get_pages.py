@@ -187,21 +187,20 @@ def test_grpc_get_pages_direct_mixed_goodput(
         assert mixed["wide_pages"] == repetitions * 100
         assert mixed["wide_read_errors"] == 0
         assert vectored_calls >= repetitions * 5
-        discarded_timer_starts = 0.0
     else:
         assert mixed["wide_pages"] == 0
         assert mixed["wide_read_errors"] == repetitions
         assert vectored_calls == repetitions
-        discarded_timer_starts = timer_starts / repetitions - CAP
     assert timer_starts >= repetitions * (CAP + 100)
     returned_pages = mixed["normal_pages"] + mixed["wide_pages"]
+    returned_pages_per_pair = returned_pages / repetitions
+    timer_starts_per_pair = timer_starts / repetitions
+    unreturned_timer_starts = timer_starts_per_pair - returned_pages_per_pair
+    assert unreturned_timer_starts >= 0
     emit("grpc_get_pages_direct_mixed_goodput_pages_per_second", returned_pages * 1_000_000_000 / elapsed)
-    emit("grpc_get_pages_direct_mixed_returned_pages_per_pair", returned_pages / repetitions)
-    emit(
-        "server_discarded_get_page_timer_starts_per_direct_over_cap_frame",
-        discarded_timer_starts,
-    )
-    emit("server_get_page_timer_starts_per_direct_mixed_pair", timer_starts / repetitions)
+    emit("grpc_get_pages_direct_mixed_returned_pages_per_pair", returned_pages_per_pair)
+    emit("server_unreturned_get_page_timer_starts_per_direct_mixed_pair", unreturned_timer_starts)
+    emit("server_get_page_timer_starts_per_direct_mixed_pair", timer_starts_per_pair)
     emit("server_get_vectored_calls_per_direct_mixed_pair", vectored_calls / repetitions)
     emit("grpc_get_pages_direct_over_cap_completed", int(direct_completed))
     print("verified_grpc_get_pages_direct_mixed_goodput")
