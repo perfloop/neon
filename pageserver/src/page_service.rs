@@ -3529,10 +3529,6 @@ impl GrpcPageServiceHandler {
     ///
     /// NB: errors returned from here are intercepted in get_pages(), and may be converted to a
     /// GetPageResponse with an appropriate status code to avoid terminating the stream.
-    ///
-    /// TODO: get_vectored() currently enforces a batch limit of 32. Postgres will typically send
-    /// batches up to effective_io_concurrency = 100. Either we have to accept large batches, or
-    /// split them up in the client or server.
     #[instrument(skip_all, fields(
         req_id = %req.request_id,
         rel = %req.rel,
@@ -3547,7 +3543,57 @@ impl GrpcPageServiceHandler {
         io_concurrency: IoConcurrency,
         received_at: Instant,
     ) -> Result<page_api::GetPageResponse, tonic::Status> {
-        let ctx = ctx.with_scope_page_service_pagestream(&timeline);
+        let max_keys = timeline.conf.max_get_vectored_keys.get();
+        if req.block_numbers.len() <= max_keys {
+            return Self::get_page_chunk(ctx, &timeline, req, io_concurrency, received_at).await;
+        }
+
+        let chunk_count = req.block_numbers.len().div_ceil(max_keys);
+        let mut pages = Vec::with_capacity(req.block_numbers.len());
+        for (chunk_index, block_numbers) in req.block_numbers.chunks(max_keys).enumerate() {
+            let mut response = Self::get_page_chunk(
+                ctx,
+                &timeline,
+                page_api::GetPageRequest {
+                    request_id: req.request_id,
+                    request_class: req.request_class,
+                    read_lsn: req.read_lsn,
+                    rel: req.rel,
+                    block_numbers: block_numbers.to_vec(),
+                },
+                io_concurrency.clone(),
+                received_at,
+            )
+            .await?;
+
+            if chunk_index + 1 == chunk_count {
+                fail::fail_point!("ps::grpc-get-pages-final-chunk", |_| {
+                    Err(tonic::Status::internal(
+                        "injected final internal GetPages batch error",
+                    ))
+                });
+            }
+            pages.append(&mut response.pages);
+        }
+
+        Ok(page_api::GetPageResponse {
+            request_id: req.request_id,
+            status_code: page_api::GetPageStatusCode::Ok,
+            reason: None,
+            rel: req.rel,
+            pages,
+        })
+    }
+
+    /// Executes one GetPages chunk whose size is within the vectored-key limit.
+    async fn get_page_chunk(
+        ctx: &RequestContext,
+        timeline: &Handle<TenantManagerTypes>,
+        req: page_api::GetPageRequest,
+        io_concurrency: IoConcurrency,
+        received_at: Instant,
+    ) -> Result<page_api::GetPageResponse, tonic::Status> {
+        let ctx = ctx.with_scope_page_service_pagestream(timeline);
 
         for &blkno in &req.block_numbers {
             let shard = timeline.get_shard_identity();
@@ -3564,7 +3610,7 @@ impl GrpcPageServiceHandler {
 
         let latest_gc_cutoff_lsn = timeline.get_applied_gc_cutoff_lsn(); // hold guard
         let effective_lsn = PageServerHandler::effective_request_lsn(
-            &timeline,
+            timeline,
             timeline.get_last_record_lsn(),
             req.read_lsn.request_lsn,
             req.read_lsn
@@ -3579,7 +3625,7 @@ impl GrpcPageServiceHandler {
             // the entire batch, and throttle only the batch, but this is equivalent to what
             // PageServerHandler does already so we keep it for now.
             let timer = Self::record_op_start_and_throttle(
-                &timeline,
+                timeline,
                 metrics::SmgrQueryType::GetPageAtLsn,
                 received_at,
             )
@@ -3605,7 +3651,7 @@ impl GrpcPageServiceHandler {
         // all for one relation, we could do this only once. However, this is not the case for the
         // libpq implementation.
         let results = PageServerHandler::handle_get_page_at_lsn_request_batched(
-            &timeline,
+            timeline,
             batch,
             io_concurrency,
             GetPageBatchBreakReason::BatchFull, // TODO: not relevant for gRPC batches
