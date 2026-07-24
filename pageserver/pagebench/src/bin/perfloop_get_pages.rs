@@ -1,11 +1,9 @@
-use std::collections::VecDeque;
-use std::time::Instant;
-
 use anyhow::{bail, Context};
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use pageserver_page_api as page_api;
 use serde_json::json;
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use utils::id::{TenantId, TimelineId};
@@ -216,7 +214,6 @@ async fn main() -> anyhow::Result<()> {
             emit(&response, mismatches);
         }
         Mode::Frame => {
-            let started = Instant::now();
             let mut pending = VecDeque::from([expected.clone()]);
             let mut returned = Vec::with_capacity(expected.len());
             let mut attempts = 0usize;
@@ -254,7 +251,6 @@ async fn main() -> anyhow::Result<()> {
                     "returned_pages": returned.len(),
                     "grpc_request_messages": attempts,
                     "oversized_fallbacks": fallbacks,
-                    "elapsed_ns": started.elapsed().as_nanos(),
                 })
             );
         }

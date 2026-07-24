@@ -45,7 +45,7 @@ log="$PWD/test_output/perfloop-get-pages-build.$$.log"
 set -euo pipefail
 : "${TEST_OUTPUT:?TEST_OUTPUT must name a worktree-local runtime directory}"
 log="$TEST_OUTPUT/perfloop-get-pages-benchmark.log"
-if PERFLOOP_GET_PAGES_BIN="$PWD/target/debug/perfloop_get_pages" ./scripts/pytest -q -s test_runner/regress/test_grpc_get_pages.py::test_grpc_get_pages_large_frames >"$log" 2>&1; then :; else status=$?; cat "$log" >&2; exit "$status"; fi
+if PERFLOOP_GET_PAGES_BIN="$PWD/target/debug/perfloop_get_pages" ./scripts/pytest -q -s "${PERFLOOP_GET_PAGES_TEST:?PERFLOOP_GET_PAGES_TEST must name one test}" >"$log" 2>&1; then :; else status=$?; cat "$log" >&2; exit "$status"; fi
 python3 - "$log" <<'JSON'
 import json, sys
 emitted = 0
