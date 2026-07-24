@@ -137,10 +137,17 @@ def temporary_output_dir(env: dict[str, str], purpose: str) -> tempfile.Temporar
 
 
 def run_pytest(
-    node: str, *, out_dir: Path | None, capture: bool
+    node: str, *, out_dir: Path | None, capture: bool, build_if_missing: bool = False
 ) -> subprocess.CompletedProcess[str]:
     env = command_environment()
-    python, release_dir = require_runtime(env)
+    try:
+        python, release_dir = require_runtime(env)
+    except RuntimeError:
+        if not build_if_missing:
+            raise
+        build()
+        env = command_environment()
+        python, release_dir = require_runtime(env)
     with temporary_output_dir(env, "pytest") as run_dir:
         test_output = Path(run_dir) / "test-output"
         test_output.mkdir()
@@ -200,16 +207,25 @@ def sample() -> None:
             print(json.dumps({"metric": metric, "value": records[metric]}, separators=(",", ":")))
 
 
+def planner_unit_check() -> None:
+    env = command_environment()
+    run(["cargo", "test", "--package", "pageserver_compaction", "--test", "tests"], env=env)
+
+
 def check(name: str) -> None:
     if name == "planner-unit":
-        env = command_environment()
-        run(["cargo", "test", "--package", "pageserver_compaction", "--test", "tests"], env=env)
+        planner_unit_check()
+        return
+    if name == "correctness":
+        for node in CHECK_NODES.values():
+            run_pytest(node, out_dir=None, capture=False, build_if_missing=True)
+        planner_unit_check()
         return
     try:
         node = CHECK_NODES[name]
     except KeyError:
         die(f"unknown check: {name}")
-    run_pytest(node, out_dir=None, capture=False)
+    run_pytest(node, out_dir=None, capture=False, build_if_missing=True)
 
 
 def main() -> None:
@@ -217,7 +233,7 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--build", action="store_true")
     mode.add_argument("--sample", action="store_true")
-    mode.add_argument("--check", choices=[*CHECK_NODES, "planner-unit"])
+    mode.add_argument("--check", choices=[*CHECK_NODES, "planner-unit", "correctness"])
     args = parser.parse_args()
 
     if args.build:
