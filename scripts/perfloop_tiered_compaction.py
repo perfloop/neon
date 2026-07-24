@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -81,6 +82,16 @@ def poetry_command(env: dict[str, str]) -> Path:
     return poetry
 
 
+def install_benchmark_artifact() -> None:
+    artifact = os.environ.get("PERFLOOP_BENCH_BIN")
+    if artifact is None:
+        return
+    destination = Path(artifact)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(repository_root() / "scripts" / "perfloop_tiered_compaction.py", destination)
+    destination.chmod(0o755)
+
+
 def build() -> None:
     env = command_environment()
     run(
@@ -111,6 +122,7 @@ def build() -> None:
         ],
         env=make_env,
     )
+    install_benchmark_artifact()
 
 
 def require_runtime(env: dict[str, str]) -> tuple[Path, Path]:
