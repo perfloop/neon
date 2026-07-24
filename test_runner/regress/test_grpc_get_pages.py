@@ -57,6 +57,7 @@ def run(
     relation: tuple[int, int, int],
     size: int,
     mode: str,
+    repetitions: int = 1,
 ) -> dict[str, Any]:
     dbnode, spcnode, relnode = relation
     binary = Path(os.environ.get("PERFLOOP_GET_PAGES_BIN", str(neon_binpath / "perfloop_get_pages")))
@@ -81,6 +82,8 @@ def run(
         str(size),
         "--fallback-chunk-size",
         str(CAP),
+        "--repetitions",
+        str(repetitions),
         "--mode",
         mode,
     ]
@@ -153,13 +156,13 @@ def test_grpc_get_pages_frame_boundaries(
     print("verified_grpc_get_pages_frame_boundaries")
 
 
-def test_grpc_get_pages_direct_over_cap_discarded_work(
+def test_grpc_get_pages_direct_mixed_goodput(
     neon_env_builder: NeonEnvBuilder, neon_binpath: Path, pg_bin: PgBin
 ):
-    repetitions = int(os.environ.get("PERFLOOP_GRPC_GET_PAGE_DIRECT_OVER_CAP_REPETITIONS", "1"))
+    repetitions = int(os.environ.get("PERFLOOP_GRPC_GET_PAGE_DIRECT_MIXED_REPETITIONS", "1"))
     assert repetitions > 0
     neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={CAP}"
-    env, relation, lsn = make_relation(neon_env_builder, "perfloop_grpc_get_pages_direct_over_cap", 100)
+    env, relation, lsn = make_relation(neon_env_builder, "perfloop_grpc_get_pages_direct_mixed", 100)
     env.pageserver.allowed_errors.append(r".*grpc:pageservice.*request failed with Internal: Read error.*")
     verified = run(pg_bin, neon_binpath, env, lsn, relation, 100, "verify")
     direct_completed = verified["status"] == "ok"
@@ -174,29 +177,34 @@ def test_grpc_get_pages_direct_over_cap_discarded_work(
     }
     before_timers = metric(env, SMGR, filters)
     before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
-    results = [run(pg_bin, neon_binpath, env, lsn, relation, 100, "raw") for _ in range(repetitions)]
+    started = perf_counter_ns()
+    mixed = run(pg_bin, neon_binpath, env, lsn, relation, 100, "mixed", repetitions)
+    elapsed = perf_counter_ns() - started
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
+    assert mixed["normal_pages"] == repetitions * CAP
     if direct_completed:
-        for result in results:
-            assert_ok(result, 100)
-        assert timer_starts >= repetitions * 100
-        assert vectored_calls >= repetitions * 4
+        assert mixed["wide_pages"] == repetitions * 100
+        assert mixed["wide_read_errors"] == 0
+        assert vectored_calls >= repetitions * 5
         discarded_timer_starts = 0.0
     else:
-        for result in results:
-            assert_late_oversized(result)
-        assert timer_starts >= repetitions * 100
-        assert vectored_calls == 0
-        discarded_timer_starts = timer_starts / repetitions
+        assert mixed["wide_pages"] == 0
+        assert mixed["wide_read_errors"] == repetitions
+        assert vectored_calls == repetitions
+        discarded_timer_starts = timer_starts / repetitions - CAP
+    assert timer_starts >= repetitions * (CAP + 100)
+    returned_pages = mixed["normal_pages"] + mixed["wide_pages"]
+    emit("grpc_get_pages_direct_mixed_goodput_pages_per_second", returned_pages * 1_000_000_000 / elapsed)
+    emit("grpc_get_pages_direct_mixed_returned_pages_per_pair", returned_pages / repetitions)
     emit(
         "server_discarded_get_page_timer_starts_per_direct_over_cap_frame",
         discarded_timer_starts,
     )
-    emit("server_get_page_timer_starts_per_direct_over_cap_frame", timer_starts / repetitions)
-    emit("server_get_vectored_calls_per_direct_over_cap_frame", vectored_calls / repetitions)
+    emit("server_get_page_timer_starts_per_direct_mixed_pair", timer_starts / repetitions)
+    emit("server_get_vectored_calls_per_direct_mixed_pair", vectored_calls / repetitions)
     emit("grpc_get_pages_direct_over_cap_completed", int(direct_completed))
-    print("verified_grpc_get_pages_direct_over_cap_discarded_work")
+    print("verified_grpc_get_pages_direct_mixed_goodput")
 
 
 def test_grpc_get_pages_late_chunk_preflight_and_error_boundary(

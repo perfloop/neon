@@ -15,6 +15,7 @@ const PAGE_SIZE: usize = 8192;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Mode {
     Frame,
+    Mixed,
     Raw,
     Verify,
 }
@@ -41,6 +42,8 @@ struct Args {
     frame_size: usize,
     #[arg(long, default_value_t = 32)]
     fallback_chunk_size: usize,
+    #[arg(long, default_value_t = 1)]
+    repetitions: usize,
     #[arg(long, value_enum, default_value_t = Mode::Frame)]
     mode: Mode,
 }
@@ -212,6 +215,57 @@ async fn main() -> anyhow::Result<()> {
                     .count();
             }
             emit(&response, mismatches);
+        }
+        Mode::Mixed => {
+            if args.repetitions == 0 || expected.len() <= args.fallback_chunk_size {
+                bail!("mixed mode needs a nonempty over-cap frame and positive repetitions");
+            }
+            let normal = expected[..args.fallback_chunk_size].to_vec();
+            let mut normal_pages = 0usize;
+            let mut wide_pages = 0usize;
+            let mut wide_read_errors = 0usize;
+            for pair in 0..args.repetitions {
+                let normal_id = u64::try_from(
+                    pair.checked_mul(2)
+                        .and_then(|id| id.checked_add(1))
+                        .context("request ID overflow")?,
+                )?;
+                let normal_response = send(
+                    &tx,
+                    &mut responses,
+                    request(&args, rel, normal_id, normal.clone()),
+                )
+                .await?;
+                validate(&normal_response, &normal)?;
+                normal_pages += normal_response.pages.len();
+
+                let wide_id = normal_id.checked_add(1).context("request ID overflow")?;
+                let wide_response = send(
+                    &tx,
+                    &mut responses,
+                    request(&args, rel, wide_id, expected.clone()),
+                )
+                .await?;
+                if wide_response.status_code == page_api::GetPageStatusCode::Ok {
+                    validate(&wide_response, &expected)?;
+                    wide_pages += wide_response.pages.len();
+                } else if wide_response.status_code == page_api::GetPageStatusCode::InternalError
+                    && wide_response.reason.as_deref() == Some("Read error")
+                    && wide_response.pages.is_empty()
+                {
+                    wide_read_errors += 1;
+                } else {
+                    bail!("unexpected mixed-mode wide response: {wide_response:?}");
+                }
+            }
+            println!(
+                "{}",
+                json!({
+                    "normal_pages": normal_pages,
+                    "wide_pages": wide_pages,
+                    "wide_read_errors": wide_read_errors,
+                })
+            );
         }
         Mode::Frame => {
             let mut pending = VecDeque::from([expected.clone()]);
