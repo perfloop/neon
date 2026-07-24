@@ -8,26 +8,14 @@
 //! doesn't remove any garbage, it just reshuffles the records to reduce read
 //! amplification, i.e. the number of files that you need to access to find the
 //! WAL records for a given key.
-//!
-//! If the new delta files would be very "narrow", i.e. each file would cover
-//! only a narrow key range, then we create a new set of image files
-//! instead. The current threshold is that if the estimated total size of the
-//! image layers is smaller than the size of the deltas, then we create image
-//! layers. That amounts to 2x storage amplification, and it means that the
-//! distance of image layers in LSN dimension is roughly equal to the logical
-//! database size. For example, if the logical database size is 10 GB, we would
-//! generate new image layers every 10 GB of WAL.
 use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 
 use futures::StreamExt;
-use pageserver_api::shard::ShardIdentity;
 use tracing::{debug, info};
 use utils::lsn::Lsn;
 
-use crate::helpers::{
-    PAGE_SZ, accum_key_values, keyspace_total_size, merge_delta_keys_buffered, overlaps_with,
-};
+use crate::helpers::{accum_key_values, merge_delta_keys_buffered, overlaps_with};
 use crate::identify_levels::identify_level;
 use crate::interface::*;
 
@@ -87,11 +75,19 @@ pub async fn compact_tiered<E: CompactionJobExecutor>(
         for l in &level.layers {
             debug!("LEVEL {} layer: {}", current_level_no, l.short_id());
         }
-        if depth < fanout {
+        // A fanout of one is meaningful only for L0: it requests that every
+        // L0 delta be promoted. Above L0, rewriting a single tier has no
+        // compaction benefit and can reproduce an existing layer descriptor.
+        let level_fanout = if current_level_no == 0 {
+            fanout
+        } else {
+            exp_base
+        };
+        if depth < level_fanout {
             debug!(
                 level = current_level_no,
                 depth = depth,
-                fanout,
+                fanout = level_fanout,
                 "too few deltas to compact"
             );
             break;
@@ -133,7 +129,6 @@ async fn compact_level<E: CompactionJobExecutor>(
     }
 
     let mut state = LevelCompactionState {
-        shard_identity: *executor.get_shard_identity(),
         target_file_size,
         _lsn_range: lsn_range.clone(),
         layers: layer_fragments,
@@ -173,8 +168,6 @@ struct LevelCompactionState<'a, E>
 where
     E: CompactionJobExecutor,
 {
-    shard_identity: ShardIdentity,
-
     // parameters
     target_file_size: u64,
 
@@ -257,7 +250,6 @@ where
 enum CompactionStrategy {
     Divide,
     CreateDelta,
-    CreateImage,
 }
 
 struct CompactionJob<E: CompactionJobExecutor> {
@@ -333,15 +325,6 @@ where
 
                 Ok(())
             }
-            CompactionStrategy::CreateImage => {
-                self.executor
-                    .create_image(job.lsn_range.end, &job.key_range, ctx)
-                    .await?;
-                self.jobs[job_id.0].completed = true;
-
-                // TODO: we could check if any layers < PITR horizon became deletable
-                Ok(())
-            }
         }
     }
 
@@ -352,12 +335,11 @@ where
         job_id
     }
 
-    /// Take a partition of the key space, and decide how to compact it.
+    /// Retile one partition of the key space into delta layers.
     ///
-    /// TODO: Currently, this is called exactly once for the level, and we
-    /// decide whether to create new image layers to cover the whole level, or
-    /// write a new set of deltas. In the future, this should try to partition
-    /// the key space, and make the decision separately for each partition.
+    /// This is currently called once for the whole level. Image materialization
+    /// needs an explicit density and retention policy before it can be planned
+    /// alongside delta retile jobs.
     async fn divide_job(&mut self, job_id: JobId, ctx: &E::RequestContext) -> anyhow::Result<()> {
         let job = &self.jobs[job_id.0];
         assert!(job.strategy == CompactionStrategy::Divide);
@@ -370,99 +352,12 @@ where
         let job = &self.jobs[job_id.0];
         assert!(job.strategy == CompactionStrategy::Divide);
 
-        // Would it be better to create images for this partition?
-        // Decide based on the average density of the level
-        let keyspace_size = keyspace_total_size(
-            &self
-                .executor
-                .get_keyspace(&job.key_range, job.lsn_range.end, ctx)
-                .await?,
-            &self.shard_identity,
-        ) * PAGE_SZ;
-
-        let wal_size = job
-            .input_layers
-            .iter()
-            .filter(|layer_id| self.layers[layer_id.0].layer.is_delta())
-            .map(|layer_id| self.layers[layer_id.0].layer.file_size())
-            .sum::<u64>();
-        if keyspace_size < wal_size {
-            // seems worth it
-            info!(
-                "covering with images, because keyspace_size is {}, size of deltas between {}-{} is {}",
-                keyspace_size, job.lsn_range.start, job.lsn_range.end, wal_size
-            );
-            self.cover_with_images(job_id, ctx).await
-        } else {
-            // do deltas
-            info!(
-                "coverage not worth it, keyspace_size {}, wal_size {}",
-                keyspace_size, wal_size
-            );
-            self.retile_deltas(job_id, ctx).await
-        }
-    }
-
-    // LSN
-    //  ^
-    //  |
-    //  |                          ###|###|#####
-    //  | +--+-----+--+            +--+-----+--+
-    //  | |  |     |  |            |  |     |  |
-    //  | +--+--+--+--+            +--+--+--+--+
-    //  | |     |     |            |     |     |
-    //  | +---+-+-+---+     ==>    +---+-+-+---+
-    //  | |   |   |   |            |   |   |   |
-    //  | +---+-+-++--+            +---+-+-++--+
-    //  | |     |  |  |            |     |  |  |
-    //  | +-----+--+--+            +-----+--+--+
-    //  |
-    //  +--------------> key
-    //
-    async fn cover_with_images(
-        &mut self,
-        job_id: JobId,
-        ctx: &E::RequestContext,
-    ) -> anyhow::Result<()> {
-        let job = &self.jobs[job_id.0];
-        assert!(job.strategy == CompactionStrategy::Divide);
-
-        // XXX: do we still need the "holes" stuff?
-
-        let mut new_jobs = Vec::new();
-
-        // Slide a window through the keyspace
-        let keyspace = self
-            .executor
-            .get_keyspace(&job.key_range, job.lsn_range.end, ctx)
-            .await?;
-
-        let mut window = KeyspaceWindow::new(
-            E::Key::MIN..E::Key::MAX,
-            keyspace,
-            self.target_file_size / PAGE_SZ,
-        );
-        while let Some(key_range) = window.choose_next_image(&self.shard_identity) {
-            new_jobs.push(CompactionJob::<E> {
-                key_range,
-                lsn_range: job.lsn_range.clone(),
-                strategy: CompactionStrategy::CreateImage,
-                input_layers: Vec::new(), // XXX: Is it OK for  this to be empty for image layer?
-                completed: false,
-            });
-        }
-
-        for j in new_jobs.into_iter().rev() {
-            let _job_id = self.push_job(j);
-
-            // TODO: image layers don't let us delete anything. unless < PITR horizon
-            //let j = &self.jobs[job_id.0];
-            // for layer_id in j.input_layers.iter() {
-            //    self.layers[layer_id.0].pending_stakeholders.insert(job_id);
-            //}
-        }
-
-        Ok(())
+        // Retiling delta layers only needs their indexed entries. Reconstructing the
+        // entire live keyspace here makes a narrow L0 merge scale with unrelated
+        // relations, and the image path does not yet retire the covered inputs.
+        // Keep ordinary tiered compaction delta-only until image materialization has
+        // an explicit density and retention policy.
+        self.retile_deltas(job_id, ctx).await
     }
 
     // Merge the contents of all the input delta layers into a new set
@@ -522,15 +417,9 @@ where
         let job = &self.jobs[job_id.0];
         assert!(job.strategy == CompactionStrategy::Divide);
 
-        // Sweep the key space left to right, running an estimate of how much
-        // disk size and keyspace we have accumulated
-        //
-        // Once the disk size reaches the target threshold, stop and think.
-        // If we have accumulated only a narrow band of keyspace, create an
-        // image layer. Otherwise write a delta layer.
-
-        // FIXME: we are ignoring images here. Did we already divide the work
-        // so that we won't encounter them here?
+        // Sweep the key space left to right, estimating how much data the
+        // next delta layer would contain. Split at a key boundary once it
+        // reaches the target size.
 
         let mut deltas: Vec<E::DeltaLayer> = Vec::new();
         for layer_id in &job.input_layers {
@@ -662,141 +551,6 @@ where
         Ok(())
     }
 }
-
-/// Sliding window through keyspace and values for image layer
-/// This is used by [`LevelCompactionState::cover_with_images`] to decide on good split points
-struct KeyspaceWindow<K> {
-    head: KeyspaceWindowHead<K>,
-
-    start_pos: KeyspaceWindowPos<K>,
-}
-struct KeyspaceWindowHead<K> {
-    // overall key range to cover
-    key_range: Range<K>,
-
-    keyspace: Vec<Range<K>>,
-    target_keysize: u64,
-}
-
-#[derive(Clone)]
-struct KeyspaceWindowPos<K> {
-    end_key: K,
-
-    keyspace_idx: usize,
-
-    accum_keysize: u64,
-}
-impl<K: CompactionKey> KeyspaceWindowPos<K> {
-    fn reached_end(&self, w: &KeyspaceWindowHead<K>) -> bool {
-        self.keyspace_idx == w.keyspace.len()
-    }
-
-    // Advance the cursor until it reaches 'target_keysize'.
-    fn advance_until_size(
-        &mut self,
-        w: &KeyspaceWindowHead<K>,
-        max_size: u64,
-        shard_identity: &ShardIdentity,
-    ) {
-        while self.accum_keysize < max_size && !self.reached_end(w) {
-            let curr_range = &w.keyspace[self.keyspace_idx];
-            if self.end_key < curr_range.start {
-                // skip over any unused space
-                self.end_key = curr_range.start;
-            }
-
-            // We're now within 'curr_range'. Can we advance past it completely?
-            let distance = K::key_range_size(&(self.end_key..curr_range.end), shard_identity);
-            if (self.accum_keysize + distance as u64) < max_size {
-                // oh yeah, it fits
-                self.end_key = curr_range.end;
-                self.keyspace_idx += 1;
-                self.accum_keysize += distance as u64;
-            } else {
-                // advance within the range
-                let skip_key = self.end_key.skip_some();
-                let distance = K::key_range_size(&(self.end_key..skip_key), shard_identity);
-                if (self.accum_keysize + distance as u64) < max_size {
-                    self.end_key = skip_key;
-                    self.accum_keysize += distance as u64;
-                } else {
-                    self.end_key = self.end_key.next();
-                    self.accum_keysize += 1;
-                }
-            }
-        }
-    }
-}
-
-impl<K> KeyspaceWindow<K>
-where
-    K: CompactionKey,
-{
-    fn new(key_range: Range<K>, keyspace: CompactionKeySpace<K>, target_keysize: u64) -> Self {
-        assert!(keyspace.first().unwrap().start >= key_range.start);
-
-        let start_key = key_range.start;
-        let start_pos = KeyspaceWindowPos::<K> {
-            end_key: start_key,
-            keyspace_idx: 0,
-            accum_keysize: 0,
-        };
-        Self {
-            head: KeyspaceWindowHead::<K> {
-                key_range,
-                keyspace,
-                target_keysize,
-            },
-            start_pos,
-        }
-    }
-
-    fn choose_next_image(&mut self, shard_identity: &ShardIdentity) -> Option<Range<K>> {
-        if self.start_pos.keyspace_idx == self.head.keyspace.len() {
-            // we've reached the end
-            return None;
-        }
-
-        let mut next_pos = self.start_pos.clone();
-        next_pos.advance_until_size(
-            &self.head,
-            self.start_pos.accum_keysize + self.head.target_keysize,
-            shard_identity,
-        );
-
-        // See if we can gobble up the rest of the keyspace if we stretch out the layer, up to
-        // 1.25x target size
-        let mut end_pos = next_pos.clone();
-        end_pos.advance_until_size(
-            &self.head,
-            self.start_pos.accum_keysize + (self.head.target_keysize * 5 / 4),
-            shard_identity,
-        );
-        if end_pos.reached_end(&self.head) {
-            // gobble up any unused keyspace between the last used key and end of the range
-            assert!(end_pos.end_key <= self.head.key_range.end);
-            end_pos.end_key = self.head.key_range.end;
-            next_pos = end_pos;
-        }
-
-        let start_key = self.start_pos.end_key;
-        self.start_pos = next_pos;
-        Some(start_key..self.start_pos.end_key)
-    }
-}
-
-// Take previous partitioning, based on the image layers below.
-//
-// Candidate is at the front:
-//
-// Consider stretching an image layer to next divider? If it's close enough,
-// that's the image candidate
-//
-// If it's too far, consider splitting at a reasonable point
-//
-// Is the image candidate smaller than the equivalent delta? If so,
-// split off the image. Otherwise, split off one delta.
-// Try to snap off the delta at a reasonable point
 
 struct WindowElement<K> {
     start_key: K, // inclusive

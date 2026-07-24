@@ -47,6 +47,23 @@ async fn test_many_updates_for_single_key() {
 }
 
 #[tokio::test]
+async fn test_delta_retile_does_not_reconstruct_keyspace() {
+    setup_logging();
+    let mut executor = MockTimeline::new();
+    executor.target_file_size = 1_000;
+
+    for _ in 0..4 {
+        executor.ingest_uniform(10, 100, &(0..1_000)).unwrap();
+        executor.flush_l0();
+    }
+
+    executor.compact().await.unwrap();
+
+    assert_eq!(executor.keyspace_request_count(), 0);
+    assert!(executor.live_layers.iter().all(|layer| layer.is_delta()));
+}
+
+#[tokio::test]
 async fn test_simple_updates() {
     setup_logging();
     let mut executor = MockTimeline::new();

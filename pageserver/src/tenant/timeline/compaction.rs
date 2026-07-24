@@ -2590,12 +2590,10 @@ impl Timeline {
             return Err(CompactionError::new_cancelled());
         }
 
-        let (dense_ks, _sparse_ks) = self
-            .collect_keyspace(end_lsn, ctx)
-            .await
-            .map_err(CompactionError::from_collect_keyspace)?;
-        // TODO(chi): ignore sparse_keyspace for now, compact it in the future.
-        let mut adaptor = TimelineAdaptor::new(self, (end_lsn, dense_ks));
+        // Delta retiling reads only the selected layers' indexes. Keep keyspace
+        // reconstruction lazy in the adaptor for an explicit future image job,
+        // rather than charging every narrow L0 merge for the whole catalog.
+        let mut adaptor = TimelineAdaptor::new(self);
 
         pageserver_compaction::compact_tiered::compact_tiered(
             &mut adaptor,
@@ -4194,7 +4192,9 @@ impl Timeline {
 struct TimelineAdaptor {
     timeline: Arc<Timeline>,
 
-    keyspace: (Lsn, KeySpace),
+    // Image materialization needs a reconstructed keyspace, but delta retiling
+    // does not. Populate this only if an image job explicitly asks for it.
+    keyspace: Option<(Lsn, KeySpace)>,
 
     new_deltas: Vec<ResidentLayer>,
     new_images: Vec<ResidentLayer>,
@@ -4202,10 +4202,10 @@ struct TimelineAdaptor {
 }
 
 impl TimelineAdaptor {
-    pub fn new(timeline: &Arc<Timeline>, keyspace: (Lsn, KeySpace)) -> Self {
+    pub fn new(timeline: &Arc<Timeline>) -> Self {
         Self {
             timeline: timeline.clone(),
-            keyspace,
+            keyspace: None,
             new_images: Vec::new(),
             new_deltas: Vec::new(),
             layers_to_delete: Vec::new(),
@@ -4284,18 +4284,28 @@ impl CompactionJobExecutor for TimelineAdaptor {
         &mut self,
         key_range: &Range<Key>,
         lsn: Lsn,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
     ) -> anyhow::Result<Vec<Range<Key>>> {
-        if lsn == self.keyspace.0 {
-            Ok(pageserver_compaction::helpers::intersect_keyspace(
-                &self.keyspace.1.ranges,
+        if let Some((cached_lsn, keyspace)) = &self.keyspace {
+            if lsn != *cached_lsn {
+                // The current image implementation only requests the keyspace at
+                // the compaction end LSN. Keep that invariant when it becomes
+                // reachable again.
+                anyhow::bail!("keyspace not available for requested lsn");
+            }
+            return Ok(pageserver_compaction::helpers::intersect_keyspace(
+                &keyspace.ranges,
                 key_range,
-            ))
-        } else {
-            // The current compaction implementation only ever requests the key space
-            // at the compaction end LSN.
-            anyhow::bail!("keyspace not available for requested lsn");
+            ));
         }
+
+        let (dense_keyspace, _sparse_keyspace) = self.timeline.collect_keyspace(lsn, ctx).await?;
+        self.keyspace = Some((lsn, dense_keyspace));
+        let (_, keyspace) = self.keyspace.as_ref().expect("keyspace was just populated");
+        Ok(pageserver_compaction::helpers::intersect_keyspace(
+            &keyspace.ranges,
+            key_range,
+        ))
     }
 
     async fn downcast_delta_layer(
@@ -4369,6 +4379,13 @@ impl CompactionJobExecutor for TimelineAdaptor {
             key, lsn, ref val, ..
         } in all_entries.iter()
         {
+            // Input layers can extend beyond this retile job's rectangle. Do
+            // not copy their records into an output whose layer descriptor
+            // covers a smaller LSN or key range.
+            if !key_range.contains(&key) || !lsn_range.contains(&lsn) {
+                continue;
+            }
+
             if prev == Some((key, lsn)) {
                 // This is a duplicate. Skip it.
                 //

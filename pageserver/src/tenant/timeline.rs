@@ -6304,7 +6304,6 @@ mod compaction_error {
     use utils::sync::gate::GateError;
 
     use crate::{
-        pgdatadir_mapping::CollectKeySpaceError,
         tenant::{PageReconstructError, blob_io::WriteBlobError, upload_queue::NotInitialized},
         virtual_file::owned_buffers_io::write::FlushTaskError,
     };
@@ -6371,13 +6370,6 @@ mod compaction_error {
             match self {
                 CompactionError::ShuttingDown(ForbidMatching) => anyhow::Error::new(self),
                 CompactionError::Other(e) => e,
-            }
-        }
-        pub fn from_collect_keyspace(err: CollectKeySpaceError) -> Self {
-            if err.is_cancel() {
-                Self::new_cancelled()
-            } else {
-                Self::Other(err.into_anyhow())
             }
         }
     }

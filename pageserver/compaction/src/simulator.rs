@@ -35,6 +35,7 @@ pub struct MockTimeline {
 
     // Current keyspace at `end_lsn`. This is updated on every ingested record.
     keyspace: KeySpace,
+    keyspace_requests: u64,
 
     // historic keyspaces
     old_keyspaces: Vec<(Lsn, KeySpace)>,
@@ -179,6 +180,10 @@ impl interface::CompactionLayer<Key> for Arc<MockImageLayer> {
 }
 
 impl MockTimeline {
+    pub fn keyspace_request_count(&self) -> u64 {
+        self.keyspace_requests
+    }
+
     pub fn new() -> Self {
         MockTimeline {
             target_file_size: 256 * 1024 * 1024,
@@ -193,6 +198,7 @@ impl MockTimeline {
             start_lsn: Lsn(1000),
             end_lsn: Lsn(1000),
             keyspace: KeySpace::new(),
+            keyspace_requests: 0,
 
             old_keyspaces: vec![],
 
@@ -463,6 +469,7 @@ impl interface::CompactionJobExecutor for MockTimeline {
         _lsn: Lsn,
         _ctx: &Self::RequestContext,
     ) -> anyhow::Result<interface::CompactionKeySpace<Key>> {
+        self.keyspace_requests += 1;
         // find it in the levels
         if self.old_keyspaces.is_empty() {
             Ok(crate::helpers::intersect_keyspace(
