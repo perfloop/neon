@@ -79,7 +79,7 @@ log="$log_dir/perfloop-get-pages-build.$$.log"
     test -f pg_install/v16/lib/postgresql/neon.so
 
     if [[ -n "${PERFLOOP_BENCH_BIN:-}" ]]; then
-        install -d "$(dirname "$PERFLOOP_BENCH_BIN")"
+        mkdir -p "$(dirname "$PERFLOOP_BENCH_BIN")"
         cat >"$PERFLOOP_BENCH_BIN" <<'PERFLOOP_RUNNER'
 #!/usr/bin/env bash
 set -euo pipefail
