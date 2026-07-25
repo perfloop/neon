@@ -1,5 +1,4 @@
 use anyhow::{Context, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
@@ -20,7 +19,6 @@ enum Mode {
     Bounded,
     Probe,
     Raw,
-    Reference,
     Suffix,
 }
 
@@ -165,14 +163,6 @@ fn verify_images(
     Ok(mismatches)
 }
 
-fn encoded_images(response: &page_api::GetPageResponse) -> Vec<String> {
-    response
-        .pages
-        .iter()
-        .map(|page| STANDARD.encode(page.image.as_ref()))
-        .collect()
-}
-
 async fn get_references<S>(
     tx: &mpsc::Sender<page_api::GetPageRequest>,
     responses: &mut S,
@@ -255,21 +245,38 @@ async fn main() -> anyhow::Result<()> {
             if expected.len() <= args.fallback_chunk_size {
                 bail!("bounded mode needs an over-cap frame");
             }
+            let normal = expected[..args.fallback_chunk_size].to_vec();
+            let mut next_request_id = 1_u64;
+            let references = get_references(
+                &tx,
+                &mut responses,
+                &args,
+                rel,
+                &normal,
+                &mut next_request_id,
+            )
+            .await?;
             let oversized = send(
                 &tx,
                 &mut responses,
-                request(&args, rel, 1, expected.clone()),
+                request(&args, rel, next_request_id, expected.clone()),
             )
             .await?;
+            next_request_id = next_request_id
+                .checked_add(1)
+                .context("GetPages bounded request ID overflow")?;
             if oversized.status_code != page_api::GetPageStatusCode::Ok
                 && !oversized.pages.is_empty()
             {
                 bail!("non-OK GetPages response contained pages: {oversized:?}");
             }
-            let normal = expected[..args.fallback_chunk_size].to_vec();
-            let following =
-                send(&tx, &mut responses, request(&args, rel, 2, normal.clone())).await?;
-            validate(&following, &normal)?;
+            let following = send(
+                &tx,
+                &mut responses,
+                request(&args, rel, next_request_id, normal.clone()),
+            )
+            .await?;
+            let mismatches = verify_images(&following, &normal, &references)?;
             println!(
                 "{}",
                 json!({
@@ -277,7 +284,8 @@ async fn main() -> anyhow::Result<()> {
                     "oversized_reason": oversized.reason,
                     "oversized_pages": oversized.pages.len(),
                     "following_pages": following.pages.len(),
-                    "following_images": encoded_images(&following),
+                    "following_image_byte_mismatches": mismatches,
+                    "reference_pages": references.len(),
                 })
             );
         }
@@ -323,35 +331,6 @@ async fn main() -> anyhow::Result<()> {
             };
             emit(&response, mismatches, references.len(), request_elapsed_ns);
         }
-        Mode::Reference => {
-            let mut next_request_id = 1_u64;
-            let references = get_references(
-                &tx,
-                &mut responses,
-                &args,
-                rel,
-                &expected,
-                &mut next_request_id,
-            )
-            .await?;
-            let images = expected
-                .iter()
-                .map(|block| {
-                    references
-                        .get(block)
-                        .map(|image| STANDARD.encode(image.as_ref()))
-                        .context("GetPages reference image was missing")
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            println!(
-                "{}",
-                json!({
-                    "status": "ok",
-                    "response_pages": expected.len(),
-                    "reference_images": images,
-                })
-            );
-        }
         Mode::Suffix => {
             let suffix = args
                 .suffix_block
@@ -363,19 +342,36 @@ async fn main() -> anyhow::Result<()> {
             if prefix.is_empty() {
                 bail!("suffix mode needs a nonempty local prefix");
             }
+            let mut next_request_id = 1_u64;
+            let references = get_references(
+                &tx,
+                &mut responses,
+                &args,
+                rel,
+                &prefix,
+                &mut next_request_id,
+            )
+            .await?;
             let prefixed = send(
                 &tx,
                 &mut responses,
-                request(&args, rel, 1, expected.clone()),
+                request(&args, rel, next_request_id, expected.clone()),
             )
             .await?;
+            next_request_id = next_request_id
+                .checked_add(1)
+                .context("GetPages suffix request ID overflow")?;
             if prefixed.status_code != page_api::GetPageStatusCode::Ok && !prefixed.pages.is_empty()
             {
                 bail!("non-OK GetPages response contained pages: {prefixed:?}");
             }
-            let following =
-                send(&tx, &mut responses, request(&args, rel, 2, prefix.clone())).await?;
-            validate(&following, &prefix)?;
+            let following = send(
+                &tx,
+                &mut responses,
+                request(&args, rel, next_request_id, prefix.clone()),
+            )
+            .await?;
+            let mismatches = verify_images(&following, &prefix, &references)?;
             println!(
                 "{}",
                 json!({
@@ -383,7 +379,8 @@ async fn main() -> anyhow::Result<()> {
                     "prefixed_reason": prefixed.reason,
                     "prefixed_pages": prefixed.pages.len(),
                     "following_pages": following.pages.len(),
-                    "following_images": encoded_images(&following),
+                    "following_image_byte_mismatches": mismatches,
+                    "reference_pages": references.len(),
                 })
             );
         }
