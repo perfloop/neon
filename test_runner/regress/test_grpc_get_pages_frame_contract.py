@@ -162,7 +162,6 @@ def sample_direct_frame(
     frame_contract_binary(neon_binpath)
     before_timers = metric(env, SMGR, filters)
     before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
-    started = time.perf_counter_ns()
     result = run(
         pg_bin,
         neon_binpath,
@@ -173,10 +172,22 @@ def sample_direct_frame(
         "raw",
         repeat_block=repeat_block,
     )
-    elapsed_ns = time.perf_counter_ns() - started
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
-    return result, timer_starts, vectored_calls, elapsed_ns
+    reference_pages = result["reference_pages"]
+    assert reference_pages == (1 if repeat_block is not None else size)
+    # The helper obtains independent single-page references before timing the public frame.
+    # Account for that setup so the returned counters describe only the requested frame.
+    assert (timer_starts, vectored_calls) == (
+        size + reference_pages,
+        (size + CAP - 1) // CAP + reference_pages,
+    )
+    return (
+        result,
+        timer_starts - reference_pages,
+        vectored_calls - reference_pages,
+        result["request_elapsed_ns"],
+    )
 
 
 def emit_control_metric(name: str, value: float | int) -> None:
@@ -406,7 +417,7 @@ def test_grpc_get_pages_child_suffix_frame_contract(
             lsn,
             relation,
             1,
-            "raw",
+            "probe",
             start_block=block,
             shard_count=8,
         )

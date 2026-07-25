@@ -1,8 +1,10 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use pageserver_page_api as page_api;
 use serde_json::json;
+use std::collections::BTreeMap;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use utils::id::{TenantId, TimelineId};
@@ -14,6 +16,7 @@ const PAGE_SIZE: usize = 8192;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Mode {
     Bounded,
+    Probe,
     Raw,
     Suffix,
 }
@@ -138,7 +141,12 @@ fn validate(response: &page_api::GetPageResponse, expected: &[u32]) -> anyhow::R
     Ok(())
 }
 
-fn emit(response: &page_api::GetPageResponse, mismatches: usize) {
+fn emit(
+    response: &page_api::GetPageResponse,
+    mismatches: usize,
+    reference_pages: usize,
+    request_elapsed_ns: u128,
+) {
     println!(
         "{}",
         json!({
@@ -147,6 +155,8 @@ fn emit(response: &page_api::GetPageResponse, mismatches: usize) {
             "response_pages": response.pages.len(),
             "request_id_matches": true,
             "image_byte_mismatches": mismatches,
+            "reference_pages": reference_pages,
+            "request_elapsed_ns": request_elapsed_ns,
         })
     );
 }
@@ -207,17 +217,66 @@ async fn main() -> anyhow::Result<()> {
                 })
             );
         }
-        Mode::Raw => {
+        Mode::Probe => {
+            let started = Instant::now();
             let response = send(
                 &tx,
                 &mut responses,
                 request(&args, rel, 1, expected.clone()),
             )
             .await?;
+            let request_elapsed_ns = started.elapsed().as_nanos();
             if response.status_code == page_api::GetPageStatusCode::Ok {
                 validate(&response, &expected)?;
             }
-            emit(&response, 0);
+            emit(&response, 0, 0, request_elapsed_ns);
+        }
+        Mode::Raw => {
+            // Obtain one independent single-page image for each distinct requested block before
+            // issuing the public frame. The resulting map also checks every repeated entry.
+            let mut references = BTreeMap::new();
+            let mut next_request_id = 1_u64;
+            for &block in &expected {
+                if references.contains_key(&block) {
+                    continue;
+                }
+                let reference = send(
+                    &tx,
+                    &mut responses,
+                    request(&args, rel, next_request_id, vec![block]),
+                )
+                .await?;
+                validate(&reference, &[block])?;
+                references.insert(block, reference.pages[0].image.clone());
+                next_request_id = next_request_id
+                    .checked_add(1)
+                    .context("GetPages reference request ID overflow")?;
+            }
+
+            let started = Instant::now();
+            let response = send(
+                &tx,
+                &mut responses,
+                request(&args, rel, next_request_id, expected.clone()),
+            )
+            .await?;
+            let request_elapsed_ns = started.elapsed().as_nanos();
+            let mut mismatches = 0;
+            if response.status_code == page_api::GetPageStatusCode::Ok {
+                validate(&response, &expected)?;
+                for (&block, page) in expected.iter().zip(&response.pages) {
+                    let reference = references
+                        .get(&block)
+                        .context("GetPages reference image was missing")?;
+                    if page.image.as_ref() != reference.as_ref() {
+                        mismatches += 1;
+                    }
+                }
+                if mismatches != 0 {
+                    bail!("GetPages frame image bytes differed from independent references");
+                }
+            }
+            emit(&response, mismatches, references.len(), request_elapsed_ns);
         }
         Mode::Suffix => {
             let suffix = args

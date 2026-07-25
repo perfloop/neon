@@ -3614,7 +3614,6 @@ impl GrpcPageServiceHandler {
                 effective_lsn,
             )
             .await?;
-            drop(latest_gc_cutoff_lsn);
             return Ok(response);
         }
 
@@ -3650,7 +3649,6 @@ impl GrpcPageServiceHandler {
             }
         }
 
-        drop(latest_gc_cutoff_lsn);
         Ok(page_api::GetPageResponse {
             request_id: req.request_id,
             status_code: page_api::GetPageStatusCode::Ok,
