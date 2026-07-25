@@ -119,6 +119,21 @@ const GRPC_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// like 8 GetPage streams per connections, plus any unary requests.
 const GRPC_MAX_CONCURRENT_STREAMS: u32 = 256;
 
+/// Tonic's default gRPC message limit. Keep this explicit because GetPages response assembly
+/// derives its public frame bound from the same outbound limit.
+const GRPC_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// Keep GetPages responses within half of the outbound gRPC limit, leaving the other half as
+/// headroom for response metadata and future protocol growth.
+const GET_PAGES_RESPONSE_BUDGET_BYTES: usize = GRPC_MAX_MESSAGE_SIZE / 2;
+const GET_PAGES_RESPONSE_HEADER_BYTES: usize = 1024;
+/// A repeated Page contributes its field tag and length, a block number tag and varint, and an
+/// image tag and length in addition to its image bytes.
+const GET_PAGES_RESPONSE_PAGE_WIRE_OVERHEAD: usize = 12;
+const MAX_GET_PAGES_RESPONSE_PAGES: usize = (GET_PAGES_RESPONSE_BUDGET_BYTES
+    - GET_PAGES_RESPONSE_HEADER_BYTES)
+    / (BLCKSZ as usize + GET_PAGES_RESPONSE_PAGE_WIRE_OVERHEAD);
+
 ///////////////////////////////////////////////////////////////////////////////
 
 pub struct Listener {
@@ -3390,6 +3405,8 @@ impl GrpcPageServiceHandler {
             // Run the page service.
             .service(
                 proto::PageServiceServer::new(page_service_handler)
+                    .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
                     // Support both gzip and zstd compression. The client decides what to use.
                     .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
                     .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
@@ -3525,6 +3542,35 @@ impl GrpcPageServiceHandler {
         Ok(timer)
     }
 
+    fn validate_get_page_frame_bound(req: &page_api::GetPageRequest) -> Result<(), tonic::Status> {
+        if req.block_numbers.len() > MAX_GET_PAGES_RESPONSE_PAGES {
+            return Err(tonic::Status::invalid_argument(format!(
+                "GetPages request has {} blocks, limit is {MAX_GET_PAGES_RESPONSE_PAGES}",
+                req.block_numbers.len(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_get_page_shard_locality(
+        timeline: &Timeline,
+        req: &page_api::GetPageRequest,
+    ) -> Result<(), tonic::Status> {
+        for &blkno in &req.block_numbers {
+            let shard = timeline.get_shard_identity();
+            let key = rel_block_to_key(req.rel, blkno);
+            if !shard.is_key_local(&key) {
+                return Err(tonic::Status::invalid_argument(format!(
+                    "block {blkno} of relation {} requested on wrong shard {} (is on {})",
+                    req.rel,
+                    timeline.get_shard_index(),
+                    ShardIndex::new(shard.get_shard_number(&key), shard.count),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Processes a GetPage batch request, via the GetPages bidirectional streaming RPC.
     ///
     /// NB: errors returned from here are intercepted in get_pages(), and may be converted to a
@@ -3543,6 +3589,8 @@ impl GrpcPageServiceHandler {
         io_concurrency: IoConcurrency,
         received_at: Instant,
     ) -> Result<page_api::GetPageResponse, tonic::Status> {
+        Self::validate_get_page_shard_locality(&timeline, &req)?;
+
         let max_keys = timeline.conf.max_get_vectored_keys.get();
         if req.block_numbers.len() <= max_keys {
             return Self::get_page_chunk(ctx, &timeline, req, io_concurrency, received_at).await;
@@ -3594,19 +3642,6 @@ impl GrpcPageServiceHandler {
         received_at: Instant,
     ) -> Result<page_api::GetPageResponse, tonic::Status> {
         let ctx = ctx.with_scope_page_service_pagestream(timeline);
-
-        for &blkno in &req.block_numbers {
-            let shard = timeline.get_shard_identity();
-            let key = rel_block_to_key(req.rel, blkno);
-            if !shard.is_key_local(&key) {
-                return Err(tonic::Status::invalid_argument(format!(
-                    "block {blkno} of relation {} requested on wrong shard {} (is on {})",
-                    req.rel,
-                    timeline.get_shard_index(),
-                    ShardIndex::new(shard.get_shard_number(&key), shard.count),
-                )));
-            }
-        }
 
         let latest_gc_cutoff_lsn = timeline.get_applied_gc_cutoff_lsn(); // hold guard
         let effective_lsn = PageServerHandler::effective_request_lsn(
@@ -4005,6 +4040,9 @@ impl proto::PageService for GrpcPageServiceHandler {
                 // Process the request, using a closure to capture errors.
                 let process_request = async || {
                     let req = page_api::GetPageRequest::try_from(req)?;
+                    // Keep this on the original public frame: stale-parent routing splits it into
+                    // child requests below, but still reassembles one response for the stream.
+                    Self::validate_get_page_frame_bound(&req)?;
 
                     // Fast path: use the pre-acquired timeline handle.
                     if let Some(Ok(timeline)) = timeline.as_ref().map(|t| t.upgrade()) {
