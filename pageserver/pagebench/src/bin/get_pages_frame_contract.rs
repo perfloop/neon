@@ -1,4 +1,6 @@
 use anyhow::{Context, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use pageserver_page_api as page_api;
@@ -18,6 +20,7 @@ enum Mode {
     Bounded,
     Probe,
     Raw,
+    Reference,
     Suffix,
 }
 
@@ -141,6 +144,66 @@ fn validate(response: &page_api::GetPageResponse, expected: &[u32]) -> anyhow::R
     Ok(())
 }
 
+fn verify_images(
+    response: &page_api::GetPageResponse,
+    expected: &[u32],
+    references: &BTreeMap<u32, Bytes>,
+) -> anyhow::Result<usize> {
+    validate(response, expected)?;
+    let mut mismatches = 0;
+    for (&block, page) in expected.iter().zip(&response.pages) {
+        let reference = references
+            .get(&block)
+            .context("GetPages reference image was missing")?;
+        if page.image.as_ref() != reference.as_ref() {
+            mismatches += 1;
+        }
+    }
+    if mismatches != 0 {
+        bail!("GetPages frame image bytes differed from independent references");
+    }
+    Ok(mismatches)
+}
+
+fn encoded_images(response: &page_api::GetPageResponse) -> Vec<String> {
+    response
+        .pages
+        .iter()
+        .map(|page| STANDARD.encode(page.image.as_ref()))
+        .collect()
+}
+
+async fn get_references<S>(
+    tx: &mpsc::Sender<page_api::GetPageRequest>,
+    responses: &mut S,
+    args: &Args,
+    rel: page_api::RelTag,
+    blocks: &[u32],
+    next_request_id: &mut u64,
+) -> anyhow::Result<BTreeMap<u32, Bytes>>
+where
+    S: futures::Stream<Item = tonic::Result<page_api::GetPageResponse>> + Unpin,
+{
+    let mut references = BTreeMap::new();
+    for &block in blocks {
+        if references.contains_key(&block) {
+            continue;
+        }
+        let reference = send(
+            tx,
+            responses,
+            request(args, rel, *next_request_id, vec![block]),
+        )
+        .await?;
+        validate(&reference, &[block])?;
+        references.insert(block, reference.pages[0].image.clone());
+        *next_request_id = next_request_id
+            .checked_add(1)
+            .context("GetPages reference request ID overflow")?;
+    }
+    Ok(references)
+}
+
 fn emit(
     response: &page_api::GetPageResponse,
     mismatches: usize,
@@ -214,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
                     "oversized_reason": oversized.reason,
                     "oversized_pages": oversized.pages.len(),
                     "following_pages": following.pages.len(),
+                    "following_images": encoded_images(&following),
                 })
             );
         }
@@ -234,25 +298,16 @@ async fn main() -> anyhow::Result<()> {
         Mode::Raw => {
             // Obtain one independent single-page image for each distinct requested block before
             // issuing the public frame. The resulting map also checks every repeated entry.
-            let mut references = BTreeMap::new();
             let mut next_request_id = 1_u64;
-            for &block in &expected {
-                if references.contains_key(&block) {
-                    continue;
-                }
-                let reference = send(
-                    &tx,
-                    &mut responses,
-                    request(&args, rel, next_request_id, vec![block]),
-                )
-                .await?;
-                validate(&reference, &[block])?;
-                references.insert(block, reference.pages[0].image.clone());
-                next_request_id = next_request_id
-                    .checked_add(1)
-                    .context("GetPages reference request ID overflow")?;
-            }
-
+            let references = get_references(
+                &tx,
+                &mut responses,
+                &args,
+                rel,
+                &expected,
+                &mut next_request_id,
+            )
+            .await?;
             let started = Instant::now();
             let response = send(
                 &tx,
@@ -261,22 +316,41 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             let request_elapsed_ns = started.elapsed().as_nanos();
-            let mut mismatches = 0;
-            if response.status_code == page_api::GetPageStatusCode::Ok {
-                validate(&response, &expected)?;
-                for (&block, page) in expected.iter().zip(&response.pages) {
-                    let reference = references
-                        .get(&block)
-                        .context("GetPages reference image was missing")?;
-                    if page.image.as_ref() != reference.as_ref() {
-                        mismatches += 1;
-                    }
-                }
-                if mismatches != 0 {
-                    bail!("GetPages frame image bytes differed from independent references");
-                }
-            }
+            let mismatches = if response.status_code == page_api::GetPageStatusCode::Ok {
+                verify_images(&response, &expected, &references)?
+            } else {
+                0
+            };
             emit(&response, mismatches, references.len(), request_elapsed_ns);
+        }
+        Mode::Reference => {
+            let mut next_request_id = 1_u64;
+            let references = get_references(
+                &tx,
+                &mut responses,
+                &args,
+                rel,
+                &expected,
+                &mut next_request_id,
+            )
+            .await?;
+            let images = expected
+                .iter()
+                .map(|block| {
+                    references
+                        .get(block)
+                        .map(|image| STANDARD.encode(image.as_ref()))
+                        .context("GetPages reference image was missing")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            println!(
+                "{}",
+                json!({
+                    "status": "ok",
+                    "response_pages": expected.len(),
+                    "reference_images": images,
+                })
+            );
         }
         Mode::Suffix => {
             let suffix = args
@@ -309,6 +383,7 @@ async fn main() -> anyhow::Result<()> {
                     "prefixed_reason": prefixed.reason,
                     "prefixed_pages": prefixed.pages.len(),
                     "following_pages": following.pages.len(),
+                    "following_images": encoded_images(&following),
                 })
             );
         }

@@ -140,6 +140,39 @@ def assert_ok(result: dict[str, Any], size: int) -> None:
     assert result["request_id_matches"] and result["image_byte_mismatches"] == 0
 
 
+def reference_images(
+    pg_bin: PgBin,
+    neon_binpath: Path,
+    env: NeonEnv,
+    lsn: Lsn,
+    relation: tuple[int, int, int],
+    size: int,
+    *,
+    repeat_block: int | None = None,
+    start_block: int = 0,
+    shard_number: int = 0,
+    shard_count: int = 0,
+) -> list[str]:
+    result = run(
+        pg_bin,
+        neon_binpath,
+        env,
+        lsn,
+        relation,
+        size,
+        "reference",
+        repeat_block=repeat_block,
+        start_block=start_block,
+        shard_number=shard_number,
+        shard_count=shard_count,
+    )
+    assert result["status"] == "ok"
+    assert result["response_pages"] == size
+    images = result["reference_images"]
+    assert len(images) == size
+    return images
+
+
 def frame_filters(env: NeonEnv) -> dict[str, str]:
     return {
         "smgr_query_type": "get_page_at_lsn",
@@ -195,12 +228,16 @@ def emit_control_metric(name: str, value: float | int) -> None:
 
 
 def assert_bounded_rejection(result: dict[str, Any]) -> None:
-    assert result == {
+    assert {
+        key: result[key]
+        for key in ("oversized_status", "oversized_reason", "oversized_pages", "following_pages")
+    } == {
         "oversized_status": "invalid_request",
         "oversized_reason": f"GetPages request has {MAX_RESPONSE_PAGES + 1} blocks, limit is {MAX_RESPONSE_PAGES}",
         "oversized_pages": 0,
         "following_pages": CAP,
     }
+    assert len(result["following_images"]) == CAP
 
 
 def assert_frame_holds_gc_cutoff(
@@ -319,6 +356,9 @@ def test_grpc_get_pages_frame_contract(
     assert (timer_starts_255, vectored_255) == (255, 8)
     assert (timer_starts_511, vectored_511) == (MAX_RESPONSE_PAGES, 16)
 
+    following_references = reference_images(
+        pg_bin, neon_binpath, env, lsn, relation, CAP, repeat_block=0
+    )
     filters = frame_filters(env)
     before_timers = metric(env, SMGR, filters)
     before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
@@ -335,6 +375,7 @@ def test_grpc_get_pages_frame_contract(
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
     assert_bounded_rejection(bounded)
+    assert bounded["following_images"] == following_references
     # The only work in this delta is the following valid 32-page request on the same stream.
     assert (timer_starts, vectored_calls) == (CAP, 1)
     assert_frame_holds_gc_cutoff(pg_bin, neon_binpath, env, endpoint, lsn, relation, table)
@@ -371,6 +412,9 @@ def test_grpc_get_pages_stale_parent_frame_contract(
     assert not env.pageserver.tenant_dir(TenantShardId(env.initial_tenant, 0, 1)).exists()
     assert len(env.storage_controller.locate(env.initial_tenant)) == 8
 
+    following_references = reference_images(
+        pg_bin, neon_binpath, env, lsn, relation, CAP, repeat_block=0
+    )
     filters = frame_filters(env)
     before_timers = metric(env, SMGR, filters)
     before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
@@ -387,6 +431,7 @@ def test_grpc_get_pages_stale_parent_frame_contract(
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
     assert_bounded_rejection(bounded)
+    assert bounded["following_images"] == following_references
     # Bound validation is on the original public frame, before stale-parent routing.
     assert (timer_starts, vectored_calls) == (CAP, 1)
     print("verified_grpc_get_pages_stale_parent_frame_contract")
@@ -434,6 +479,16 @@ def test_grpc_get_pages_child_suffix_frame_contract(
             break
     assert local_block is not None and remote_block is not None
 
+    following_references = reference_images(
+        pg_bin,
+        neon_binpath,
+        env,
+        lsn,
+        relation,
+        CAP,
+        repeat_block=local_block,
+        shard_count=8,
+    )
     filters = frame_filters(env)
     before_timers = metric(env, SMGR, filters)
     before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
@@ -456,6 +511,7 @@ def test_grpc_get_pages_child_suffix_frame_contract(
     assert f"block {remote_block}" in prefixed["prefixed_reason"]
     assert "wrong shard" in prefixed["prefixed_reason"]
     assert prefixed["following_pages"] == CAP
+    assert prefixed["following_images"] == following_references
     # The rejected local-prefix/foreign-suffix request must not start timers or vectored reads.
     assert (timer_starts, vectored_calls) == (CAP, 1)
     print("verified_grpc_get_pages_child_suffix_frame_contract")

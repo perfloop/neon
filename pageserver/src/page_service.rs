@@ -3608,7 +3608,10 @@ impl GrpcPageServiceHandler {
             let response = Self::get_page_chunk(
                 &ctx,
                 &timeline,
-                req,
+                req.request_id,
+                req.read_lsn,
+                req.rel,
+                &req.block_numbers,
                 io_concurrency,
                 received_at,
                 effective_lsn,
@@ -3623,13 +3626,10 @@ impl GrpcPageServiceHandler {
             let mut response = Self::get_page_chunk(
                 &ctx,
                 &timeline,
-                page_api::GetPageRequest {
-                    request_id: req.request_id,
-                    request_class: req.request_class,
-                    read_lsn: req.read_lsn,
-                    rel: req.rel,
-                    block_numbers: block_numbers.to_vec(),
-                },
+                req.request_id,
+                req.read_lsn,
+                req.rel,
+                block_numbers,
                 io_concurrency.clone(),
                 received_at,
                 effective_lsn,
@@ -3662,13 +3662,16 @@ impl GrpcPageServiceHandler {
     async fn get_page_chunk(
         ctx: &RequestContext,
         timeline: &Handle<TenantManagerTypes>,
-        req: page_api::GetPageRequest,
+        request_id: page_api::RequestID,
+        read_lsn: page_api::ReadLsn,
+        rel: page_api::RelTag,
+        block_numbers: &[u32],
         io_concurrency: IoConcurrency,
         received_at: Instant,
         effective_lsn: Lsn,
     ) -> Result<page_api::GetPageResponse, tonic::Status> {
-        let mut batch = SmallVec::with_capacity(req.block_numbers.len());
-        for blkno in req.block_numbers {
+        let mut batch = SmallVec::with_capacity(block_numbers.len());
+        for &blkno in block_numbers {
             // TODO: this creates one timer per page and throttles it. We should have a timer for
             // the entire batch, and throttle only the batch, but this is equivalent to what
             // PageServerHandler does already so we keep it for now.
@@ -3681,13 +3684,13 @@ impl GrpcPageServiceHandler {
 
             batch.push(BatchedGetPageRequest {
                 req: PagestreamGetPageRequest {
-                    hdr: Self::make_hdr(req.read_lsn, Some(req.request_id)),
-                    rel: req.rel,
+                    hdr: Self::make_hdr(read_lsn, Some(request_id)),
+                    rel,
                     blkno,
                 },
                 lsn_range: LsnRange {
                     effective_lsn,
-                    request_lsn: req.read_lsn.request_lsn,
+                    request_lsn: read_lsn.request_lsn,
                 },
                 timer,
                 ctx: ctx.attached_child(),
@@ -3708,10 +3711,10 @@ impl GrpcPageServiceHandler {
         .await;
 
         let mut resp = page_api::GetPageResponse {
-            request_id: req.request_id,
+            request_id,
             status_code: page_api::GetPageStatusCode::Ok,
             reason: None,
-            rel: req.rel,
+            rel,
             pages: Vec::with_capacity(results.len()),
         };
 
