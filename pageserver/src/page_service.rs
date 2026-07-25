@@ -134,12 +134,6 @@ const MAX_GET_PAGES_RESPONSE_PAGES: usize = (GRPC_MAX_ENCODING_MESSAGE_SIZE
     - GET_PAGES_RESPONSE_FIXED_WIRE_BYTES)
     / GET_PAGES_RESPONSE_PAGE_WIRE_BYTES;
 
-// A valid public GetPages frame can carry at most the response-bounded number of block numbers.
-// Even an unpacked max-width uint32 costs six wire bytes, leaving over 1 KiB for its fixed request
-// metadata below. The other PageService requests are control-only. Cap decoding here, before Prost
-// materializes an untrusted repeated field into a Vec.
-const GRPC_MAX_DECODING_MESSAGE_SIZE: usize = MAX_GET_PAGES_RESPONSE_PAGES * 6 + 1024;
-
 ///////////////////////////////////////////////////////////////////////////////
 
 pub struct Listener {
@@ -3412,7 +3406,6 @@ impl GrpcPageServiceHandler {
             .service(
                 proto::PageServiceServer::new(page_service_handler)
                     .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE)
-                    .max_decoding_message_size(GRPC_MAX_DECODING_MESSAGE_SIZE)
                     // Support both gzip and zstd compression. The client decides what to use.
                     .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
                     .accept_compressed(tonic::codec::CompressionEncoding::Zstd)

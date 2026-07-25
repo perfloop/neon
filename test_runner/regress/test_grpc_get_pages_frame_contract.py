@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -90,7 +89,6 @@ def run(
     *,
     repeat_block: int | None = None,
     suffix_block: int | None = None,
-    recovery_block: int | None = None,
     start_block: int = 0,
     shard_number: int = 0,
     shard_count: int = 0,
@@ -130,8 +128,6 @@ def run(
         command.extend(("--repeat-block", str(repeat_block)))
     if suffix_block is not None:
         command.extend(("--suffix-block", str(suffix_block)))
-    if recovery_block is not None:
-        command.extend(("--recovery-block", str(recovery_block)))
     basepath = pg_bin.run_capture(command, with_command_header=False)
     result = json.loads(Path(basepath + ".stdout").read_text())
     assert isinstance(result, dict), result
@@ -352,7 +348,6 @@ def test_grpc_get_pages_frame_contract(
         CAP,
         1,
     )
-    assert_inbound_frame_bound(pg_bin, neon_binpath, env, lsn, relation)
     assert_frame_holds_gc_cutoff(pg_bin, neon_binpath, env, endpoint, lsn, relation, table)
 
     for size, result, vectored_calls, elapsed_ns in (
@@ -412,73 +407,6 @@ def test_grpc_get_pages_stale_parent_frame_contract(
         1,
     )
     print("verified_grpc_get_pages_stale_parent_frame_contract")
-
-
-def assert_inbound_frame_bound(
-    pg_bin: PgBin,
-    neon_binpath: Path,
-    env: NeonEnv,
-    lsn: Lsn,
-    relation: tuple[int, int, int],
-):
-    filters = frame_filters(env)
-    before_timers = metric(env, SMGR, filters)
-    before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
-    inbound = run(
-        pg_bin,
-        neon_binpath,
-        env,
-        lsn,
-        relation,
-        1024,
-        "inbound",
-        repeat_block=(1 << 32) - 1,
-    )
-    assert inbound["stream_status"] == "OutOfRange"
-    limit_match = re.search(r"limit is: (\d+) bytes", inbound["stream_message"])
-    assert limit_match is not None, inbound
-    decoder_limit = int(limit_match.group(1))
-    assert inbound["inbound_wire_bytes"] > decoder_limit
-    assert metric(env, SMGR, filters) - before_timers == 0
-    assert metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored == 0
-
-    following = run(pg_bin, neon_binpath, env, lsn, relation, CAP, "probe")
-    assert_ok(following, CAP)
-    assert (
-        metric(env, SMGR, filters) - before_timers,
-        metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored,
-    ) == (CAP, 1)
-
-    before_timers = metric(env, SMGR, filters)
-    before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
-    near_limit = run(
-        pg_bin,
-        neon_binpath,
-        env,
-        lsn,
-        relation,
-        768,
-        "bounded",
-        repeat_block=(1 << 32) - 1,
-        recovery_block=0,
-    )
-    assert decoder_limit * 0.9 < near_limit["oversized_wire_bytes"] < decoder_limit
-    assert near_limit["oversized_status"] == "invalid_request"
-    assert near_limit["oversized_reason"] == (
-        f"GetPages request has 768 blocks, limit is {MAX_RESPONSE_PAGES}"
-    )
-    assert near_limit["oversized_pages"] == 0
-    assert near_limit["following_pages"] == CAP
-    assert near_limit["following_image_byte_mismatches"] == 0
-    assert near_limit["oversized_elapsed_ns"] > 0
-    assert (
-        metric(env, SMGR, filters) - before_timers,
-        metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored,
-    ) == (near_limit["reference_pages"] + CAP, 2)
-    print(
-        "verified_grpc_get_pages_inbound_frame_bound "
-        f"decoder_limit={decoder_limit} near_limit_elapsed_ns={near_limit['oversized_elapsed_ns']}"
-    )
 
 
 def test_grpc_get_pages_child_suffix_frame_contract(

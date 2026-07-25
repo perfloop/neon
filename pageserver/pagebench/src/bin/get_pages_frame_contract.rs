@@ -3,7 +3,6 @@ use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use pageserver_page_api as page_api;
-use prost::Message;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -18,7 +17,6 @@ const PAGE_SIZE: usize = 8192;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Mode {
     Bounded,
-    Inbound,
     Probe,
     Raw,
     Suffix,
@@ -46,8 +44,6 @@ struct Args {
     repeat_block: Option<u32>,
     #[arg(long)]
     suffix_block: Option<u32>,
-    #[arg(long)]
-    recovery_block: Option<u32>,
     #[arg(long, default_value_t = 0)]
     shard_number: u8,
     #[arg(long, default_value_t = 0)]
@@ -96,11 +92,6 @@ fn request(
         rel,
         block_numbers: blocks,
     }
-}
-
-fn encoded_len(request: page_api::GetPageRequest) -> usize {
-    let request: page_api::proto::GetPageRequest = request.into();
-    request.encoded_len()
 }
 
 async fn send<S>(
@@ -254,10 +245,7 @@ async fn main() -> anyhow::Result<()> {
             if expected.len() <= args.fallback_chunk_size {
                 bail!("bounded mode needs an over-cap frame");
             }
-            let normal = args
-                .recovery_block
-                .map(|block| vec![block; args.fallback_chunk_size])
-                .unwrap_or_else(|| expected[..args.fallback_chunk_size].to_vec());
+            let normal = expected[..args.fallback_chunk_size].to_vec();
             let mut next_request_id = 1_u64;
             let references = get_references(
                 &tx,
@@ -268,11 +256,12 @@ async fn main() -> anyhow::Result<()> {
                 &mut next_request_id,
             )
             .await?;
-            let oversized_request = request(&args, rel, next_request_id, expected.clone());
-            let oversized_wire_bytes = encoded_len(oversized_request.clone());
-            let started = Instant::now();
-            let oversized = send(&tx, &mut responses, oversized_request).await?;
-            let oversized_elapsed_ns = started.elapsed().as_nanos();
+            let oversized = send(
+                &tx,
+                &mut responses,
+                request(&args, rel, next_request_id, expected.clone()),
+            )
+            .await?;
             next_request_id = next_request_id
                 .checked_add(1)
                 .context("GetPages bounded request ID overflow")?;
@@ -294,33 +283,9 @@ async fn main() -> anyhow::Result<()> {
                     "oversized_status": status(&oversized),
                     "oversized_reason": oversized.reason,
                     "oversized_pages": oversized.pages.len(),
-                    "oversized_wire_bytes": oversized_wire_bytes,
-                    "oversized_elapsed_ns": oversized_elapsed_ns,
                     "following_pages": following.pages.len(),
                     "following_image_byte_mismatches": mismatches,
                     "reference_pages": references.len(),
-                })
-            );
-        }
-        Mode::Inbound => {
-            let inbound_request = request(&args, rel, 1, expected);
-            let inbound_wire_bytes = encoded_len(inbound_request.clone());
-            tx.send(inbound_request)
-                .await
-                .context("send oversized inbound GetPages request")?;
-            let status = match responses.next().await {
-                Some(Err(status)) => status,
-                Some(Ok(response)) => {
-                    bail!("oversized inbound GetPages request unexpectedly returned {response:?}")
-                }
-                None => bail!("oversized inbound GetPages request ended without a status"),
-            };
-            println!(
-                "{}",
-                json!({
-                    "stream_status": format!("{:?}", status.code()),
-                    "stream_message": status.message(),
-                    "inbound_wire_bytes": inbound_wire_bytes,
                 })
             );
         }
