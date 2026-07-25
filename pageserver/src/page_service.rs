@@ -119,20 +119,20 @@ const GRPC_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// like 8 GetPage streams per connections, plus any unary requests.
 const GRPC_MAX_CONCURRENT_STREAMS: u32 = 256;
 
-/// Tonic's default gRPC message limit. Keep this explicit because GetPages response assembly
-/// derives its public frame bound from the same outbound limit.
-const GRPC_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+/// The outbound gRPC message limit for page service responses. GetPages builds one response per
+/// public frame, so admission must leave every successful response within this limit.
+const GRPC_MAX_ENCODING_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
-/// Keep GetPages responses within half of the outbound gRPC limit, leaving the other half as
-/// headroom for response metadata and future protocol growth.
-const GET_PAGES_RESPONSE_BUDGET_BYTES: usize = GRPC_MAX_MESSAGE_SIZE / 2;
-const GET_PAGES_RESPONSE_HEADER_BYTES: usize = 1024;
-/// A repeated Page contributes its field tag and length, a block number tag and varint, and an
-/// image tag and length in addition to its image bytes.
-const GET_PAGES_RESPONSE_PAGE_WIRE_OVERHEAD: usize = 12;
-const MAX_GET_PAGES_RESPONSE_PAGES: usize = (GET_PAGES_RESPONSE_BUDGET_BYTES
-    - GET_PAGES_RESPONSE_HEADER_BYTES)
-    / (BLCKSZ as usize + GET_PAGES_RESPONSE_PAGE_WIRE_OVERHEAD);
+// A successful GetPages response has a request ID, status, relation, and repeated Page messages.
+// Its fixed part is at most 47 protobuf bytes for maximum-width IDs plus a five-byte gRPC
+// envelope retained as margin. Error responses have no pages.
+const GET_PAGES_RESPONSE_FIXED_WIRE_BYTES: usize = 52;
+// A Page contributes one repeated-field tag, a two-byte nested-message length, a maximum-width
+// block number, and an 8192-byte image with its tag and two-byte length.
+const GET_PAGES_RESPONSE_PAGE_WIRE_BYTES: usize = BLCKSZ as usize + 12;
+const MAX_GET_PAGES_RESPONSE_PAGES: usize = (GRPC_MAX_ENCODING_MESSAGE_SIZE
+    - GET_PAGES_RESPONSE_FIXED_WIRE_BYTES)
+    / GET_PAGES_RESPONSE_PAGE_WIRE_BYTES;
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -3405,8 +3405,7 @@ impl GrpcPageServiceHandler {
             // Run the page service.
             .service(
                 proto::PageServiceServer::new(page_service_handler)
-                    .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-                    .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE)
                     // Support both gzip and zstd compression. The client decides what to use.
                     .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
                     .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
@@ -3591,16 +3590,39 @@ impl GrpcPageServiceHandler {
     ) -> Result<page_api::GetPageResponse, tonic::Status> {
         Self::validate_get_page_shard_locality(&timeline, &req)?;
 
+        let ctx = ctx.with_scope_page_service_pagestream(&timeline);
+        // Keep the cutoff visible when this public frame was admitted until every internal chunk
+        // finishes. A GC update waits for this RCU guard before discarding that older view.
+        let latest_gc_cutoff_lsn = timeline.get_applied_gc_cutoff_lsn();
+        let effective_lsn = PageServerHandler::effective_request_lsn(
+            &timeline,
+            timeline.get_last_record_lsn(),
+            req.read_lsn.request_lsn,
+            req.read_lsn
+                .not_modified_since_lsn
+                .unwrap_or(req.read_lsn.request_lsn),
+            &latest_gc_cutoff_lsn,
+        )?;
         let max_keys = timeline.conf.max_get_vectored_keys.get();
         if req.block_numbers.len() <= max_keys {
-            return Self::get_page_chunk(ctx, &timeline, req, io_concurrency, received_at).await;
+            let response = Self::get_page_chunk(
+                &ctx,
+                &timeline,
+                req,
+                io_concurrency,
+                received_at,
+                effective_lsn,
+            )
+            .await?;
+            drop(latest_gc_cutoff_lsn);
+            return Ok(response);
         }
 
         let chunk_count = req.block_numbers.len().div_ceil(max_keys);
         let mut pages = Vec::with_capacity(req.block_numbers.len());
         for (chunk_index, block_numbers) in req.block_numbers.chunks(max_keys).enumerate() {
             let mut response = Self::get_page_chunk(
-                ctx,
+                &ctx,
                 &timeline,
                 page_api::GetPageRequest {
                     request_id: req.request_id,
@@ -3611,6 +3633,7 @@ impl GrpcPageServiceHandler {
                 },
                 io_concurrency.clone(),
                 received_at,
+                effective_lsn,
             )
             .await?;
 
@@ -3622,8 +3645,12 @@ impl GrpcPageServiceHandler {
                 });
             }
             pages.append(&mut response.pages);
+            if chunk_index + 1 < chunk_count {
+                utils::pausable_failpoint!("ps::grpc-get-pages-between-chunks");
+            }
         }
 
+        drop(latest_gc_cutoff_lsn);
         Ok(page_api::GetPageResponse {
             request_id: req.request_id,
             status_code: page_api::GetPageStatusCode::Ok,
@@ -3640,20 +3667,8 @@ impl GrpcPageServiceHandler {
         req: page_api::GetPageRequest,
         io_concurrency: IoConcurrency,
         received_at: Instant,
+        effective_lsn: Lsn,
     ) -> Result<page_api::GetPageResponse, tonic::Status> {
-        let ctx = ctx.with_scope_page_service_pagestream(timeline);
-
-        let latest_gc_cutoff_lsn = timeline.get_applied_gc_cutoff_lsn(); // hold guard
-        let effective_lsn = PageServerHandler::effective_request_lsn(
-            timeline,
-            timeline.get_last_record_lsn(),
-            req.read_lsn.request_lsn,
-            req.read_lsn
-                .not_modified_since_lsn
-                .unwrap_or(req.read_lsn.request_lsn),
-            &latest_gc_cutoff_lsn,
-        )?;
-
         let mut batch = SmallVec::with_capacity(req.block_numbers.len());
         for blkno in req.block_numbers {
             // TODO: this creates one timer per page and throttles it. We should have a timer for

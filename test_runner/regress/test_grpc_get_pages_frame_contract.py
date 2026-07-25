@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fixtures.common_types import TenantShardId
 from fixtures.neon_fixtures import wait_for_last_flush_lsn
+from fixtures.utils import wait_until
 
 if TYPE_CHECKING:
     from fixtures.common_types import Lsn
     from fixtures.neon_fixtures import NeonEnv, NeonEnvBuilder, PgBin
 
 CAP = 32
-MAX_RESPONSE_PAGES = 255
+MAX_RESPONSE_PAGES = 511
 SMGR = "pageserver_smgr_query_started_count_total"
 VECTORED = "pageserver_get_vectored_seconds_count"
 
@@ -46,6 +50,21 @@ def make_relation(builder: NeonEnvBuilder, table: str, min_blocks: int, *, strip
     return env, (int(dbnode), int(spcnode), int(relnode)), lsn
 
 
+def frame_contract_binary(neon_binpath: Path) -> Path:
+    configured_binary = os.environ.get("GET_PAGES_FRAME_CONTRACT_BIN")
+    binary = (
+        Path(configured_binary) if configured_binary else neon_binpath / "get_pages_frame_contract"
+    )
+    if not binary.is_file() and configured_binary is None:
+        subprocess.run(
+            ["cargo", "build", "--locked", "-p", "pagebench", "--bin", "get_pages_frame_contract"],
+            check=True,
+            cwd=Path(__file__).parents[2],
+        )
+    assert binary.is_file(), f"GetPages frame-contract helper not found at {binary}"
+    return binary
+
+
 def run(
     pg_bin: PgBin,
     neon_binpath: Path,
@@ -56,19 +75,13 @@ def run(
     mode: str,
     *,
     repeat_block: int | None = None,
-    cycle_blocks: list[int] | None = None,
     suffix_block: int | None = None,
     start_block: int = 0,
     shard_number: int = 0,
     shard_count: int = 0,
 ) -> dict[str, Any]:
     dbnode, spcnode, relnode = relation
-    binary = Path(
-        os.environ.get(
-            "PERFLOOP_GET_PAGES_PREFLIGHT_BIN", str(neon_binpath / "perfloop_get_pages_preflight")
-        )
-    )
-    assert binary.is_file(), f"GetPages preflight helper not found at {binary}"
+    binary = frame_contract_binary(neon_binpath)
     command = [
         str(binary),
         "--endpoint",
@@ -100,8 +113,6 @@ def run(
     ]
     if repeat_block is not None:
         command.extend(("--repeat-block", str(repeat_block)))
-    if cycle_blocks is not None:
-        command.extend(("--cycle-blocks", ",".join(map(str, cycle_blocks))))
     if suffix_block is not None:
         command.extend(("--suffix-block", str(suffix_block)))
     basepath = pg_bin.run_capture(command, with_command_header=False)
@@ -125,39 +136,128 @@ def assert_late_oversized(result: dict[str, Any]) -> None:
     assert result["request_id_matches"] and result["image_byte_mismatches"] == 0
 
 
-def test_grpc_get_pages_aggregate_frame_bound(
+def frame_filters(env: NeonEnv) -> dict[str, str]:
+    return {
+        "smgr_query_type": "get_page_at_lsn",
+        "tenant_id": str(env.initial_tenant),
+        "timeline_id": str(env.initial_timeline),
+    }
+
+
+def sample_direct_frame(
+    pg_bin: PgBin,
+    neon_binpath: Path,
+    env: NeonEnv,
+    lsn: Lsn,
+    relation: tuple[int, int, int],
+    size: int,
+    *,
+    repeat_block: int | None = None,
+) -> tuple[dict[str, Any], float, float, int]:
+    filters = frame_filters(env)
+    frame_contract_binary(neon_binpath)
+    before_timers = metric(env, SMGR, filters)
+    before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
+    started = time.perf_counter_ns()
+    result = run(
+        pg_bin,
+        neon_binpath,
+        env,
+        lsn,
+        relation,
+        size,
+        "raw",
+        repeat_block=repeat_block,
+    )
+    elapsed_ns = time.perf_counter_ns() - started
+    timer_starts = metric(env, SMGR, filters) - before_timers
+    vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
+    return result, timer_starts, vectored_calls, elapsed_ns
+
+
+def emit_control_metric(name: str, value: float | int) -> None:
+    print(json.dumps({"metric": name, "value": value}))
+
+
+def assert_bounded_rejection(result: dict[str, Any]) -> None:
+    assert result == {
+        "oversized_status": "invalid_request",
+        "oversized_reason": f"GetPages request has {MAX_RESPONSE_PAGES + 1} blocks, limit is {MAX_RESPONSE_PAGES}",
+        "oversized_pages": 0,
+        "following_pages": CAP,
+    }
+
+
+def assert_frame_holds_gc_cutoff(
+    pg_bin: PgBin,
+    neon_binpath: Path,
+    env: NeonEnv,
+    lsn: Lsn,
+    relation: tuple[int, int, int],
+) -> None:
+    failpoint = "ps::grpc-get-pages-between-chunks"
+    client = env.pageserver.http_client()
+    client.configure_failpoints((failpoint, "pause"))
+    _, configured_at = wait_until(
+        lambda: env.pageserver.assert_log_contains(f"cfg failpoint: {failpoint} pause"), timeout=20
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        frame = executor.submit(run, pg_bin, neon_binpath, env, lsn, relation, CAP + 1, "raw")
+        try:
+            wait_until(
+                lambda: env.pageserver.assert_log_contains(
+                    f"at failpoint {failpoint}", configured_at
+                ),
+                timeout=20,
+            )
+            # This test-only API advances the same RCU cutoff that real GC updates. The request
+            # began below the new cutoff, so a second chunk must retain the old guard to succeed.
+            client.timeline_patch_index_part(
+                env.initial_tenant,
+                env.initial_timeline,
+                {"applied_gc_cutoff_lsn": str(lsn + 1)},
+            )
+        finally:
+            client.configure_failpoints((failpoint, "off"))
+        assert_ok(frame.result(timeout=20), CAP + 1)
+
+
+def test_grpc_get_pages_frame_contract(
     neon_env_builder: NeonEnvBuilder, neon_binpath: Path, pg_bin: PgBin
 ):
     neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={CAP}"
-    env, relation, lsn = make_relation(neon_env_builder, "perfloop_grpc_get_pages_bounded", CAP)
+    env, relation, lsn = make_relation(neon_env_builder, "grpc_get_pages_frame_contract", 100)
     env.pageserver.allowed_errors.append(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
     )
-    direct = run(pg_bin, neon_binpath, env, lsn, relation, 100, "raw")
-    direct_completed = direct["status"] == "ok"
-    if direct_completed:
-        assert_ok(direct, 100)
-    else:
-        assert_late_oversized(direct)
-    at_limit = run(
+
+    direct_33, _timers_33, vectored_33, elapsed_33 = sample_direct_frame(
+        pg_bin, neon_binpath, env, lsn, relation, CAP + 1
+    )
+    direct_100 = run(pg_bin, neon_binpath, env, lsn, relation, 100, "raw")
+    direct_at_limit, _timers_511, vectored_511, elapsed_511 = sample_direct_frame(
         pg_bin,
         neon_binpath,
         env,
         lsn,
         relation,
         MAX_RESPONSE_PAGES,
-        "raw",
         repeat_block=0,
     )
+
+    direct_completed = direct_33["status"] == "ok"
     if direct_completed:
-        assert_ok(at_limit, MAX_RESPONSE_PAGES)
+        assert_ok(direct_33, CAP + 1)
+        assert_ok(direct_100, 100)
+        assert_ok(direct_at_limit, MAX_RESPONSE_PAGES)
+        assert vectored_33 == 2
+        assert vectored_511 == 16
     else:
-        assert_late_oversized(at_limit)
-    filters = {
-        "smgr_query_type": "get_page_at_lsn",
-        "tenant_id": str(env.initial_tenant),
-        "timeline_id": str(env.initial_timeline),
-    }
+        assert_late_oversized(direct_33)
+        assert_late_oversized(direct_100)
+        assert_late_oversized(direct_at_limit)
+
+    filters = frame_filters(env)
     before_timers = metric(env, SMGR, filters)
     before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
     bounded = run(
@@ -172,17 +272,13 @@ def test_grpc_get_pages_aggregate_frame_bound(
     )
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
-    assert bounded["following_pages"] == CAP
     if direct_completed:
-        assert bounded == {
-            "oversized_status": "invalid_request",
-            "oversized_reason": f"GetPages request has {MAX_RESPONSE_PAGES + 1} blocks, limit is {MAX_RESPONSE_PAGES}",
-            "oversized_pages": 0,
-            "following_pages": CAP,
-        }
+        assert_bounded_rejection(bounded)
         assert timer_starts == CAP and vectored_calls == 1
+        assert_frame_holds_gc_cutoff(pg_bin, neon_binpath, env, lsn, relation)
     elif bounded["oversized_status"] == "ok":
         assert bounded["oversized_pages"] == MAX_RESPONSE_PAGES + 1
+        assert bounded["following_pages"] == CAP
     else:
         assert bounded == {
             "oversized_status": "internal_error",
@@ -190,16 +286,25 @@ def test_grpc_get_pages_aggregate_frame_bound(
             "oversized_pages": 0,
             "following_pages": CAP,
         }
-    print("verified_grpc_get_pages_aggregate_frame_bound")
+
+    emit_control_metric("grpc_get_pages_direct_33_returned_pages", direct_33["response_pages"])
+    emit_control_metric("server_get_vectored_calls_per_direct_33_frame", vectored_33)
+    emit_control_metric("grpc_get_pages_direct_33_request_ns", elapsed_33)
+    emit_control_metric(
+        "grpc_get_pages_direct_511_returned_pages", direct_at_limit["response_pages"]
+    )
+    emit_control_metric("server_get_vectored_calls_per_direct_511_frame", vectored_511)
+    emit_control_metric("grpc_get_pages_direct_511_request_ns", elapsed_511)
+    print("verified_grpc_get_pages_frame_contract")
 
 
-def test_grpc_get_pages_stale_parent_frame_bound(
+def test_grpc_get_pages_stale_parent_frame_contract(
     neon_env_builder: NeonEnvBuilder, neon_binpath: Path, pg_bin: PgBin
 ):
     neon_env_builder.num_pageservers = 1
     neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={CAP}"
     env, relation, lsn = make_relation(
-        neon_env_builder, "perfloop_grpc_get_pages_stale_bounded", 100, striped=True
+        neon_env_builder, "grpc_get_pages_stale_parent_frame_contract", 100, striped=True
     )
     env.pageserver.allowed_errors.append(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
@@ -210,56 +315,12 @@ def test_grpc_get_pages_stale_parent_frame_bound(
         assert_ok(direct, 100)
     else:
         assert_late_oversized(direct)
+
     env.storage_controller.tenant_shard_split(env.initial_tenant, shard_count=8)
     assert not env.pageserver.tenant_dir(TenantShardId(env.initial_tenant, 0, 1)).exists()
     assert len(env.storage_controller.locate(env.initial_tenant)) == 8
-    child_blocks = []
-    for shard_number in range(8):
-        for block in range(100):
-            result = run(
-                pg_bin,
-                neon_binpath,
-                env,
-                lsn,
-                relation,
-                1,
-                "raw",
-                start_block=block,
-                shard_number=shard_number,
-                shard_count=8,
-            )
-            if result["status"] == "ok":
-                assert_ok(result, 1)
-                child_blocks.append(block)
-                break
-            assert result["status"] == "invalid_request"
-            assert result["response_pages"] == 0
-            assert "wrong shard" in result["reason"]
-        else:
-            raise AssertionError(f"no local relation block found for child shard {shard_number}")
-    filters = {
-        "smgr_query_type": "get_page_at_lsn",
-        "tenant_id": str(env.initial_tenant),
-        "timeline_id": str(env.initial_timeline),
-    }
-    before_timers = metric(env, SMGR, filters)
-    before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
-    normal = run(
-        pg_bin,
-        neon_binpath,
-        env,
-        lsn,
-        relation,
-        CAP,
-        "raw",
-        cycle_blocks=child_blocks,
-    )
-    assert_ok(normal, CAP)
-    normal_timer_starts = metric(env, SMGR, filters) - before_timers
-    normal_vectored_calls = (
-        metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
-    )
-    assert normal_timer_starts == CAP and normal_vectored_calls > 0
+
+    filters = frame_filters(env)
     before_timers = metric(env, SMGR, filters)
     before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
     bounded = run(
@@ -270,22 +331,16 @@ def test_grpc_get_pages_stale_parent_frame_bound(
         relation,
         MAX_RESPONSE_PAGES + 1,
         "bounded",
-        cycle_blocks=child_blocks,
+        repeat_block=0,
     )
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
-    assert bounded["following_pages"] == CAP
     if direct_completed:
-        assert bounded == {
-            "oversized_status": "invalid_request",
-            "oversized_reason": f"GetPages request has {MAX_RESPONSE_PAGES + 1} blocks, limit is {MAX_RESPONSE_PAGES}",
-            "oversized_pages": 0,
-            "following_pages": CAP,
-        }
-        assert timer_starts == normal_timer_starts
-        assert vectored_calls == normal_vectored_calls
+        assert_bounded_rejection(bounded)
+        assert timer_starts == CAP and vectored_calls == 1
     elif bounded["oversized_status"] == "ok":
         assert bounded["oversized_pages"] == MAX_RESPONSE_PAGES + 1
+        assert bounded["following_pages"] == CAP
     else:
         assert bounded == {
             "oversized_status": "internal_error",
@@ -293,16 +348,16 @@ def test_grpc_get_pages_stale_parent_frame_bound(
             "oversized_pages": 0,
             "following_pages": CAP,
         }
-    print("verified_grpc_get_pages_stale_parent_frame_bound")
+    print("verified_grpc_get_pages_stale_parent_frame_contract")
 
 
-def test_grpc_get_pages_child_suffix_preflight(
+def test_grpc_get_pages_child_suffix_frame_contract(
     neon_env_builder: NeonEnvBuilder, neon_binpath: Path, pg_bin: PgBin
 ):
     neon_env_builder.num_pageservers = 1
     neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={CAP}"
     env, relation, lsn = make_relation(
-        neon_env_builder, "perfloop_grpc_get_pages_child_suffix", 100, striped=True
+        neon_env_builder, "grpc_get_pages_child_suffix_frame_contract", 100, striped=True
     )
     env.pageserver.allowed_errors.append(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
@@ -313,6 +368,7 @@ def test_grpc_get_pages_child_suffix_preflight(
         assert_ok(direct, 100)
     else:
         assert_late_oversized(direct)
+
     env.storage_controller.tenant_shard_split(env.initial_tenant, shard_count=8)
     local_block = None
     remote_block = None
@@ -340,11 +396,8 @@ def test_grpc_get_pages_child_suffix_preflight(
         if local_block is not None and remote_block is not None:
             break
     assert local_block is not None and remote_block is not None
-    filters = {
-        "smgr_query_type": "get_page_at_lsn",
-        "tenant_id": str(env.initial_tenant),
-        "timeline_id": str(env.initial_timeline),
-    }
+
+    filters = frame_filters(env)
     before_timers = metric(env, SMGR, filters)
     before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
     prefixed = run(
@@ -361,14 +414,14 @@ def test_grpc_get_pages_child_suffix_preflight(
     )
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
-    assert prefixed["following_pages"] == CAP
     if direct_completed:
         assert prefixed["prefixed_status"] == "invalid_request"
         assert prefixed["prefixed_pages"] == 0
         assert f"block {remote_block}" in prefixed["prefixed_reason"]
         assert "wrong shard" in prefixed["prefixed_reason"]
+        assert prefixed["following_pages"] == CAP
         assert timer_starts == CAP and vectored_calls == 1
     else:
         assert prefixed["prefixed_status"] in {"internal_error", "invalid_request"}
         assert prefixed["prefixed_pages"] == 0
-    print("verified_grpc_get_pages_child_suffix_preflight")
+    print("verified_grpc_get_pages_child_suffix_frame_contract")

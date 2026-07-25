@@ -38,8 +38,6 @@ struct Args {
     start_block: u32,
     #[arg(long)]
     repeat_block: Option<u32>,
-    #[arg(long, value_delimiter = ',')]
-    cycle_blocks: Vec<u32>,
     #[arg(long)]
     suffix_block: Option<u32>,
     #[arg(long, default_value_t = 0)]
@@ -58,19 +56,9 @@ fn blocks(args: &Args) -> anyhow::Result<Vec<u32>> {
     if args.frame_size == 0 || args.fallback_chunk_size == 0 {
         bail!("frame_size and fallback_chunk_size must be nonzero");
     }
-    if args.repeat_block.is_some() && !args.cycle_blocks.is_empty() {
-        bail!("repeat_block and cycle_blocks are mutually exclusive");
-    }
     let count = u32::try_from(args.frame_size).context("frame_size does not fit in u32")?;
     let mut blocks = if let Some(block) = args.repeat_block {
         vec![block; args.frame_size]
-    } else if !args.cycle_blocks.is_empty() {
-        args.cycle_blocks
-            .iter()
-            .copied()
-            .cycle()
-            .take(args.frame_size)
-            .collect()
     } else {
         let end = args
             .start_block
