@@ -8,12 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fixtures.common_types import TenantShardId
+from fixtures.common_types import Lsn, TenantShardId
 from fixtures.neon_fixtures import wait_for_last_flush_lsn
 from fixtures.utils import wait_until
 
 if TYPE_CHECKING:
-    from fixtures.common_types import Lsn
     from fixtures.neon_fixtures import NeonEnv, NeonEnvBuilder, PgBin
 
 CAP = 32
@@ -27,11 +26,25 @@ def metric(env: NeonEnv, name: str, filters: dict[str, str]) -> float:
     return 0.0 if value is None else value
 
 
-def make_relation(builder: NeonEnvBuilder, table: str, min_blocks: int, *, striped: bool = False):
-    shards = (
-        {"initial_tenant_shard_count": 1, "initial_tenant_shard_stripe_size": 1} if striped else {}
-    )
-    env = builder.init_start(**shards)
+def make_relation(
+    builder: NeonEnvBuilder,
+    table: str,
+    min_blocks: int,
+    *,
+    striped: bool = False,
+    tenant_conf: dict[str, str] | None = None,
+):
+    init_kwargs: dict[str, Any] = {}
+    if striped:
+        init_kwargs.update(
+            {
+                "initial_tenant_shard_count": 1,
+                "initial_tenant_shard_stripe_size": 1,
+            }
+        )
+    if tenant_conf is not None:
+        init_kwargs["initial_tenant_conf"] = tenant_conf
+    env = builder.init_start(**init_kwargs)
     endpoint = env.endpoints.create_start("main")
     endpoint.safe_psql(
         f"CREATE TABLE {table} (id bigint NOT NULL, payload text NOT NULL) WITH (fillfactor = 100)"
@@ -47,7 +60,7 @@ def make_relation(builder: NeonEnvBuilder, table: str, min_blocks: int, *, strip
     )[0]
     assert blocks >= min_blocks, f"{table} has {blocks} blocks, need {min_blocks}"
     lsn = wait_for_last_flush_lsn(env, endpoint, env.initial_tenant, env.initial_timeline)
-    return env, (int(dbnode), int(spcnode), int(relnode)), lsn
+    return env, endpoint, (int(dbnode), int(spcnode), int(relnode)), lsn
 
 
 def frame_contract_binary(neon_binpath: Path) -> Path:
@@ -127,15 +140,6 @@ def assert_ok(result: dict[str, Any], size: int) -> None:
     assert result["request_id_matches"] and result["image_byte_mismatches"] == 0
 
 
-def assert_late_oversized(result: dict[str, Any]) -> None:
-    assert (result["status"], result["reason"], result["response_pages"]) == (
-        "internal_error",
-        "Read error",
-        0,
-    )
-    assert result["request_id_matches"] and result["image_byte_mismatches"] == 0
-
-
 def frame_filters(env: NeonEnv) -> dict[str, str]:
     return {
         "smgr_query_type": "get_page_at_lsn",
@@ -192,17 +196,40 @@ def assert_frame_holds_gc_cutoff(
     pg_bin: PgBin,
     neon_binpath: Path,
     env: NeonEnv,
-    lsn: Lsn,
+    endpoint: Any,
+    request_lsn: Lsn,
     relation: tuple[int, int, int],
+    table: str,
 ) -> None:
-    failpoint = "ps::grpc-get-pages-between-chunks"
     client = env.pageserver.http_client()
+    # Materialize a version after request_lsn so immediate GC can advance the cutoff past the
+    # paused frame's read point. Both checkpoints make the GC operate on actual timeline history.
+    client.timeline_checkpoint(env.initial_tenant, env.initial_timeline)
+    endpoint.safe_psql(f"UPDATE {table} SET payload = payload || 'g' WHERE id = 1")
+    wait_for_last_flush_lsn(env, endpoint, env.initial_tenant, env.initial_timeline)
+    client.timeline_checkpoint(env.initial_tenant, env.initial_timeline)
+    before_cutoff = Lsn(
+        client.timeline_detail(env.initial_tenant, env.initial_timeline)["applied_gc_cutoff_lsn"]
+    )
+    assert before_cutoff <= request_lsn
+
+    failpoint = "ps::grpc-get-pages-between-chunks"
     client.configure_failpoints((failpoint, "pause"))
     _, configured_at = wait_until(
         lambda: env.pageserver.assert_log_contains(f"cfg failpoint: {failpoint} pause"), timeout=20
     )
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        frame = executor.submit(run, pg_bin, neon_binpath, env, lsn, relation, CAP + 1, "raw")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        frame = executor.submit(
+            run,
+            pg_bin,
+            neon_binpath,
+            env,
+            request_lsn,
+            relation,
+            CAP + 1,
+            "raw",
+        )
+        gc_completion = None
         try:
             wait_until(
                 lambda: env.pageserver.assert_log_contains(
@@ -210,32 +237,56 @@ def assert_frame_holds_gc_cutoff(
                 ),
                 timeout=20,
             )
-            # This test-only API advances the same RCU cutoff that real GC updates. The request
-            # began below the new cutoff, so a second chunk must retain the old guard to succeed.
-            client.timeline_patch_index_part(
-                env.initial_tenant,
-                env.initial_timeline,
-                {"applied_gc_cutoff_lsn": str(lsn + 1)},
+            gc_completion = executor.submit(
+                client.timeline_gc, env.initial_tenant, env.initial_timeline, 0
             )
+            wait_until(
+                lambda: Lsn(
+                    client.timeline_detail(env.initial_tenant, env.initial_timeline)[
+                        "applied_gc_cutoff_lsn"
+                    ]
+                )
+                > request_lsn,
+                timeout=20,
+            )
+            # GC stores the new cutoff before waiting for pre-existing readers. If this frame
+            # dropped its RCU guard between chunks, GC can reach this log line while it is paused.
+            time.sleep(0.2)
+            assert not gc_completion.done()
+            assert env.pageserver.log_contains("GC starting", configured_at) is None
         finally:
             client.configure_failpoints((failpoint, "off"))
-        assert_ok(frame.result(timeout=20), CAP + 1)
+
+        assert_ok(frame.result(timeout=30), CAP + 1)
+        assert gc_completion is not None
+        gc_completion.result(timeout=30)
 
 
 def test_grpc_get_pages_frame_contract(
     neon_env_builder: NeonEnvBuilder, neon_binpath: Path, pg_bin: PgBin
 ):
     neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={CAP}"
-    env, relation, lsn = make_relation(neon_env_builder, "grpc_get_pages_frame_contract", 100)
+    table = "grpc_get_pages_frame_contract"
+    env, endpoint, relation, lsn = make_relation(
+        neon_env_builder,
+        table,
+        100,
+        tenant_conf={"pitr_interval": "0 sec", "lsn_lease_length": "0s"},
+    )
     env.pageserver.allowed_errors.append(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
     )
 
-    direct_33, _timers_33, vectored_33, elapsed_33 = sample_direct_frame(
+    direct_33, timer_starts_33, vectored_33, elapsed_33 = sample_direct_frame(
         pg_bin, neon_binpath, env, lsn, relation, CAP + 1
     )
-    direct_100 = run(pg_bin, neon_binpath, env, lsn, relation, 100, "raw")
-    direct_at_limit, _timers_511, vectored_511, elapsed_511 = sample_direct_frame(
+    direct_100, timer_starts_100, vectored_100, elapsed_100 = sample_direct_frame(
+        pg_bin, neon_binpath, env, lsn, relation, 100
+    )
+    direct_255, timer_starts_255, vectored_255, elapsed_255 = sample_direct_frame(
+        pg_bin, neon_binpath, env, lsn, relation, 255, repeat_block=0
+    )
+    direct_at_limit, timer_starts_511, vectored_511, elapsed_511 = sample_direct_frame(
         pg_bin,
         neon_binpath,
         env,
@@ -245,17 +296,17 @@ def test_grpc_get_pages_frame_contract(
         repeat_block=0,
     )
 
-    direct_completed = direct_33["status"] == "ok"
-    if direct_completed:
-        assert_ok(direct_33, CAP + 1)
-        assert_ok(direct_100, 100)
-        assert_ok(direct_at_limit, MAX_RESPONSE_PAGES)
-        assert vectored_33 == 2
-        assert vectored_511 == 16
-    else:
-        assert_late_oversized(direct_33)
-        assert_late_oversized(direct_100)
-        assert_late_oversized(direct_at_limit)
+    for result, size in (
+        (direct_33, CAP + 1),
+        (direct_100, 100),
+        (direct_255, 255),
+        (direct_at_limit, MAX_RESPONSE_PAGES),
+    ):
+        assert_ok(result, size)
+    assert (timer_starts_33, vectored_33) == (CAP + 1, 2)
+    assert (timer_starts_100, vectored_100) == (100, 4)
+    assert (timer_starts_255, vectored_255) == (255, 8)
+    assert (timer_starts_511, vectored_511) == (MAX_RESPONSE_PAGES, 16)
 
     filters = frame_filters(env)
     before_timers = metric(env, SMGR, filters)
@@ -272,29 +323,22 @@ def test_grpc_get_pages_frame_contract(
     )
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
-    if direct_completed:
-        assert_bounded_rejection(bounded)
-        assert timer_starts == CAP and vectored_calls == 1
-        assert_frame_holds_gc_cutoff(pg_bin, neon_binpath, env, lsn, relation)
-    elif bounded["oversized_status"] == "ok":
-        assert bounded["oversized_pages"] == MAX_RESPONSE_PAGES + 1
-        assert bounded["following_pages"] == CAP
-    else:
-        assert bounded == {
-            "oversized_status": "internal_error",
-            "oversized_reason": "Read error",
-            "oversized_pages": 0,
-            "following_pages": CAP,
-        }
+    assert_bounded_rejection(bounded)
+    # The only work in this delta is the following valid 32-page request on the same stream.
+    assert (timer_starts, vectored_calls) == (CAP, 1)
+    assert_frame_holds_gc_cutoff(pg_bin, neon_binpath, env, endpoint, lsn, relation, table)
 
-    emit_control_metric("grpc_get_pages_direct_33_returned_pages", direct_33["response_pages"])
-    emit_control_metric("server_get_vectored_calls_per_direct_33_frame", vectored_33)
-    emit_control_metric("grpc_get_pages_direct_33_request_ns", elapsed_33)
-    emit_control_metric(
-        "grpc_get_pages_direct_511_returned_pages", direct_at_limit["response_pages"]
-    )
-    emit_control_metric("server_get_vectored_calls_per_direct_511_frame", vectored_511)
-    emit_control_metric("grpc_get_pages_direct_511_request_ns", elapsed_511)
+    for size, result, vectored_calls, elapsed_ns in (
+        (CAP + 1, direct_33, vectored_33, elapsed_33),
+        (100, direct_100, vectored_100, elapsed_100),
+        (255, direct_255, vectored_255, elapsed_255),
+        (MAX_RESPONSE_PAGES, direct_at_limit, vectored_511, elapsed_511),
+    ):
+        emit_control_metric(
+            f"grpc_get_pages_direct_{size}_returned_pages", result["response_pages"]
+        )
+        emit_control_metric(f"server_get_vectored_calls_per_direct_{size}_frame", vectored_calls)
+        emit_control_metric(f"grpc_get_pages_direct_{size}_request_ns", elapsed_ns)
     print("verified_grpc_get_pages_frame_contract")
 
 
@@ -303,18 +347,14 @@ def test_grpc_get_pages_stale_parent_frame_contract(
 ):
     neon_env_builder.num_pageservers = 1
     neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={CAP}"
-    env, relation, lsn = make_relation(
+    env, _endpoint, relation, lsn = make_relation(
         neon_env_builder, "grpc_get_pages_stale_parent_frame_contract", 100, striped=True
     )
     env.pageserver.allowed_errors.append(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
     )
     direct = run(pg_bin, neon_binpath, env, lsn, relation, 100, "raw")
-    direct_completed = direct["status"] == "ok"
-    if direct_completed:
-        assert_ok(direct, 100)
-    else:
-        assert_late_oversized(direct)
+    assert_ok(direct, 100)
 
     env.storage_controller.tenant_shard_split(env.initial_tenant, shard_count=8)
     assert not env.pageserver.tenant_dir(TenantShardId(env.initial_tenant, 0, 1)).exists()
@@ -335,19 +375,9 @@ def test_grpc_get_pages_stale_parent_frame_contract(
     )
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
-    if direct_completed:
-        assert_bounded_rejection(bounded)
-        assert timer_starts == CAP and vectored_calls == 1
-    elif bounded["oversized_status"] == "ok":
-        assert bounded["oversized_pages"] == MAX_RESPONSE_PAGES + 1
-        assert bounded["following_pages"] == CAP
-    else:
-        assert bounded == {
-            "oversized_status": "internal_error",
-            "oversized_reason": "Read error",
-            "oversized_pages": 0,
-            "following_pages": CAP,
-        }
+    assert_bounded_rejection(bounded)
+    # Bound validation is on the original public frame, before stale-parent routing.
+    assert (timer_starts, vectored_calls) == (CAP, 1)
     print("verified_grpc_get_pages_stale_parent_frame_contract")
 
 
@@ -356,18 +386,14 @@ def test_grpc_get_pages_child_suffix_frame_contract(
 ):
     neon_env_builder.num_pageservers = 1
     neon_env_builder.pageserver_config_override = f"max_get_vectored_keys={CAP}"
-    env, relation, lsn = make_relation(
+    env, _endpoint, relation, lsn = make_relation(
         neon_env_builder, "grpc_get_pages_child_suffix_frame_contract", 100, striped=True
     )
     env.pageserver.allowed_errors.append(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
     )
     direct = run(pg_bin, neon_binpath, env, lsn, relation, 100, "raw")
-    direct_completed = direct["status"] == "ok"
-    if direct_completed:
-        assert_ok(direct, 100)
-    else:
-        assert_late_oversized(direct)
+    assert_ok(direct, 100)
 
     env.storage_controller.tenant_shard_split(env.initial_tenant, shard_count=8)
     local_block = None
@@ -414,14 +440,11 @@ def test_grpc_get_pages_child_suffix_frame_contract(
     )
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
-    if direct_completed:
-        assert prefixed["prefixed_status"] == "invalid_request"
-        assert prefixed["prefixed_pages"] == 0
-        assert f"block {remote_block}" in prefixed["prefixed_reason"]
-        assert "wrong shard" in prefixed["prefixed_reason"]
-        assert prefixed["following_pages"] == CAP
-        assert timer_starts == CAP and vectored_calls == 1
-    else:
-        assert prefixed["prefixed_status"] in {"internal_error", "invalid_request"}
-        assert prefixed["prefixed_pages"] == 0
+    assert prefixed["prefixed_status"] == "invalid_request"
+    assert prefixed["prefixed_pages"] == 0
+    assert f"block {remote_block}" in prefixed["prefixed_reason"]
+    assert "wrong shard" in prefixed["prefixed_reason"]
+    assert prefixed["following_pages"] == CAP
+    # The rejected local-prefix/foreign-suffix request must not start timers or vectored reads.
+    assert (timer_starts, vectored_calls) == (CAP, 1)
     print("verified_grpc_get_pages_child_suffix_frame_contract")
