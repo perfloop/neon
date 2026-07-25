@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import json
 from contextlib import closing
+from typing import TYPE_CHECKING
 
 import pytest
+from fixtures.common_types import Lsn, TenantId, TimelineId
 from fixtures.neon_fixtures import NeonEnvBuilder, wait_for_last_flush_lsn
+from fixtures.pageserver.utils import wait_for_last_record_lsn
+from fixtures.remote_storage import RemoteStorageKind
 from fixtures.utils import skip_in_debug_build
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 TARGET_BYTES = 128 * 1024
 HISTORY_BYTES = 512 * 1024
@@ -170,3 +177,95 @@ def test_tiered_compaction_stops_at_singleton_upper_tier(
         restarted.safe_psql("SELECT count(*), md5(string_agg(payload, '' ORDER BY id)) FROM anchor")
         == expected
     )
+
+
+@skip_in_debug_build("exercise imported base layers through tiered compaction")
+@pytest.mark.timeout(900)
+def test_tiered_compaction_preserves_imported_base_history_after_restart(
+    neon_env_builder: NeonEnvBuilder, vanilla_pg, pg_bin, test_output_dir: Path
+):
+    vanilla_pg.start()
+    vanilla_pg.safe_psql("CREATE USER cloud_admin WITH PASSWORD 'postgres' SUPERUSER")
+    vanilla_pg.safe_psql("CREATE TABLE stable (id integer PRIMARY KEY, payload text NOT NULL)")
+    vanilla_pg.safe_psql(
+        "INSERT INTO stable SELECT id, repeat(md5(id::text), 64) FROM generate_series(1, 32) id"
+    )
+    stable_expected = vanilla_pg.safe_psql(
+        "SELECT count(*), md5(string_agg(payload, '' ORDER BY id)) FROM stable"
+    )
+    vanilla_pg.safe_psql(
+        "CREATE TABLE history (id integer PRIMARY KEY, version integer NOT NULL, payload text NOT NULL)"
+    )
+    expected_v0 = vanilla_pg.safe_psql(
+        f"""
+        INSERT INTO history
+        SELECT 1, 0, string_agg(md5(i::text), '')
+        FROM generate_series(1, {HISTORY_CHUNKS}) AS i
+        RETURNING version, length(payload), md5(payload)
+        """
+    )[0]
+    vanilla_pg.safe_psql("CHECKPOINT")
+    backup_dir = test_output_dir / "imported-basebackup"
+    backup_dir.mkdir()
+    pg_bin.run(["pg_basebackup", "-F", "tar", "-d", vanilla_pg.connstr(), "-D", str(backup_dir)])
+    manifest = json.loads((backup_dir / "backup_manifest").read_text())
+    start_lsn = Lsn(manifest["WAL-Ranges"][0]["Start-LSN"])
+    end_lsn = Lsn(manifest["WAL-Ranges"][0]["End-LSN"])
+
+    neon_env_builder.enable_pageserver_remote_storage(RemoteStorageKind.LOCAL_FS)
+    neon_env_builder.storage_controller_config = {"timelines_onto_safekeepers": True}
+    env = neon_env_builder.init_start()
+    tenant_id, timeline_id = TenantId.generate(), TimelineId.generate()
+    env.pageserver.tenant_create(tenant_id)
+    pageserver_http = env.pageserver.http_client()
+    pageserver_http.update_tenant_config(
+        tenant_id,
+        {
+            "gc_period": "0s",
+            "compaction_period": "0s",
+            "checkpoint_distance": TARGET_BYTES,
+            "compaction_target_size": TARGET_BYTES,
+            "compaction_threshold": 1,
+            "compaction_algorithm": {"kind": "tiered"},
+        },
+    )
+    env.neon_cli.timeline_import(
+        tenant_id=tenant_id,
+        timeline_id=timeline_id,
+        new_branch_name="imported",
+        base_tarfile=backup_dir / "base.tar",
+        base_lsn=start_lsn,
+        wal_tarfile=backup_dir / "pg_wal.tar",
+        end_lsn=end_lsn,
+        pg_version=env.pg_version,
+    )
+    wait_for_last_record_lsn(pageserver_http, tenant_id, timeline_id, end_lsn)
+    pageserver_http.timeline_checkpoint(
+        tenant_id, timeline_id, compact=False, wait_until_uploaded=True
+    )
+
+    main = env.endpoints.create_start("imported", tenant_id=tenant_id)
+    expected = {"import_v0": expected_v0}
+    env.create_branch("import_v0", tenant_id=tenant_id, ancestor_branch_name="imported")
+    for version in (1, 2):
+        expected_value = _write_version(main, version)
+        _compact(env, main, tenant_id, timeline_id, pageserver_http)
+        if version == 1:
+            expected["import_v1"] = expected_value
+            env.create_branch("import_v1", tenant_id=tenant_id, ancestor_branch_name="imported")
+    expected["imported"] = expected_value
+
+    main.stop()
+    env.pageserver.restart(immediate=True)
+    for branch, expected_value in expected.items():
+        endpoint = env.endpoints.create_start(branch, tenant_id=tenant_id)
+        assert endpoint.safe_psql(
+            "SELECT version, length(payload), md5(payload) FROM history WHERE id = 1"
+        ) == [expected_value]
+        assert (
+            endpoint.safe_psql(
+                "SELECT count(*), md5(string_agg(payload, '' ORDER BY id)) FROM stable"
+            )
+            == stable_expected
+        )
+    vanilla_pg.stop()

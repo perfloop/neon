@@ -82,36 +82,6 @@ async fn test_same_lsn_values_do_not_create_empty_delta_ranges() {
     assert_eq!(executor.active_delta_record_count(), expected_record_count);
 }
 
-/// Fanout one promotes every L0 tier, but an upper tier with depth one must not
-/// be rewritten. The mock executor rejects descriptor collisions just as layer
-/// publication does, making a repeated compaction an end-to-end lifecycle test.
-#[tokio::test]
-async fn test_fanout_one_leaves_singleton_upper_tier_unchanged() {
-    setup_logging();
-    let mut executor = MockTimeline::new();
-    executor.target_file_size = 100;
-    executor.set_tiers_per_level(1);
-
-    for _ in 0..2 {
-        for key in 0..4 {
-            executor.ingest_record(key, 25);
-        }
-        executor.flush_l0();
-    }
-    executor.compact().await.unwrap();
-
-    let upper_tier = executor.active_delta_layer_ranges();
-    assert!(upper_tier.iter().all(|(key_range, lsn_range)| {
-        key_range.end - key_range.start > 1
-            && lsn_range.end.0 - lsn_range.start.0 > executor.target_file_size
-    }));
-
-    for _ in 0..3 {
-        executor.compact().await.unwrap();
-        assert_eq!(executor.active_delta_layer_ranges(), upper_tier);
-    }
-}
-
 #[tokio::test]
 async fn test_simple_updates() {
     setup_logging();
