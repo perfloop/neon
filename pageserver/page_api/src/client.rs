@@ -23,6 +23,9 @@ pub struct Client {
 
 impl Client {
     /// Connects to the given gRPC endpoint.
+    ///
+    /// `compression` enables compressed responses. PageService request frames use identity
+    /// encoding so the server can enforce its ingress message-size limit before decoding.
     pub async fn connect<E>(
         endpoint: E,
         tenant_id: TenantId,
@@ -60,10 +63,10 @@ impl Client {
         let mut inner = proto::PageServiceClient::with_interceptor(channel, auth);
 
         if let Some(compression) = compression {
-            // TODO: benchmark this (including network latency).
-            inner = inner
-                .accept_compressed(compression)
-                .send_compressed(compression);
+            // PageService accepts identity request frames only so its transport cap also bounds
+            // decompression. Keep accepting compressed responses, where the client controls the
+            // payload size it is prepared to decode.
+            inner = inner.accept_compressed(compression);
         }
 
         Ok(Self { inner })

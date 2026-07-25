@@ -86,7 +86,7 @@ pub struct PageserverClient {
     timeline_id: TimelineId,
     /// The JWT auth token for this tenant, if any.
     auth_token: Option<String>,
-    /// The compression to use, if any.
+    /// The response compression to accept, if any.
     compression: Option<CompressionEncoding>,
     /// The shards for this tenant.
     shards: ArcSwap<Shards>,

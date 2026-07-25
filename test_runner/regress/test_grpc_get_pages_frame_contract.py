@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,6 +16,7 @@ if TYPE_CHECKING:
 
 CAP = 32
 MAX_RESPONSE_PAGES = 511
+MAX_GET_PAGES_DECODING_MESSAGE_SIZE = MAX_RESPONSE_PAGES * 6 + 80
 SMGR = "pageserver_smgr_query_started_count_total"
 VECTORED = "pageserver_get_vectored_seconds_count"
 
@@ -92,6 +92,7 @@ def run(
     start_block: int = 0,
     shard_number: int = 0,
     shard_count: int = 0,
+    ingress_compression: str = "identity",
 ) -> dict[str, Any]:
     dbnode, spcnode, relnode = relation
     binary = frame_contract_binary(neon_binpath)
@@ -123,6 +124,8 @@ def run(
         str(shard_number),
         "--shard-count",
         str(shard_count),
+        "--ingress-compression",
+        ingress_compression,
     ]
     if repeat_block is not None:
         command.extend(("--repeat-block", str(repeat_block)))
@@ -208,6 +211,152 @@ def assert_bounded_rejection(result: dict[str, Any]) -> None:
     assert result["reference_pages"] == 1
 
 
+def assert_inbound_frame_bound(
+    pg_bin: PgBin,
+    neon_binpath: Path,
+    env: NeonEnv,
+    lsn: Lsn,
+    relation: tuple[int, int, int],
+) -> None:
+    """Exercise the identity decoder cap and rejected compressed expansion before page work."""
+
+    client = env.pageserver.http_client()
+    failpoint = "ps::grpc-get-pages-after-decode"
+    filters = frame_filters(env)
+    before_timers = metric(env, SMGR, filters)
+    before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
+    client.configure_failpoints((failpoint, "return"))
+    try:
+        # Find adjacent packed repeated-field frame sizes from their actual protobuf encodings.
+        # Requests below the cap reach the post-decode hook, which returns the server Vec capacity;
+        # requests above it must be rejected by Tonic before that hook can run.
+        below_count = 1
+        above_count = MAX_GET_PAGES_DECODING_MESSAGE_SIZE + 1
+        while below_count + 1 < above_count:
+            count = (below_count + above_count) // 2
+            result = run(
+                pg_bin,
+                neon_binpath,
+                env,
+                lsn,
+                relation,
+                count,
+                "ingress",
+                repeat_block=0,
+            )
+            if result["uncompressed_proto_bytes"] <= MAX_GET_PAGES_DECODING_MESSAGE_SIZE:
+                assert result["response_status"] == "invalid_request"
+                assert result["response_pages"] == 0
+                assert result["transport_status"] is None
+                assert result["post_decode_reached"]
+                assert result["post_decode_blocks"] == count
+                assert result["decoded_block_numbers_capacity_bytes"] >= count * 4
+                below_count = count
+            else:
+                assert result["response_status"] is None
+                assert result["transport_status"] == "out_of_range"
+                assert not result["post_decode_reached"]
+                above_count = count
+
+        below = run(
+            pg_bin,
+            neon_binpath,
+            env,
+            lsn,
+            relation,
+            below_count,
+            "ingress",
+            repeat_block=0,
+        )
+        above = run(
+            pg_bin,
+            neon_binpath,
+            env,
+            lsn,
+            relation,
+            above_count,
+            "ingress",
+            repeat_block=0,
+        )
+        assert above_count == below_count + 1
+        assert below["uncompressed_proto_bytes"] <= MAX_GET_PAGES_DECODING_MESSAGE_SIZE
+        assert above["uncompressed_proto_bytes"] > MAX_GET_PAGES_DECODING_MESSAGE_SIZE
+        assert below["response_status"] == "invalid_request"
+        assert below["response_pages"] == 0
+        assert below["transport_status"] is None
+        assert below["post_decode_reached"]
+        assert below["post_decode_blocks"] == below_count
+        assert below["decoded_block_numbers_capacity_bytes"] >= below_count * 4
+        assert below["request_elapsed_ns"] > 0
+        assert above["response_status"] is None
+        assert above["transport_status"] == "out_of_range"
+        assert not above["post_decode_reached"]
+        assert above["request_elapsed_ns"] > 0
+
+        # These generated-client requests carry real gzip/zstd gRPC frames. A highly
+        # compressible body hundreds of times larger than the identity cap remains below that cap
+        # on the wire. PageService rejects the unsupported request encoding before Tonic
+        # decompression and before the post-decode hook can observe a repeated-field Vec.
+        compressed_count = above_count * 256
+        for compression in ("gzip", "zstd"):
+            compressed = run(
+                pg_bin,
+                neon_binpath,
+                env,
+                lsn,
+                relation,
+                compressed_count,
+                "ingress",
+                repeat_block=0,
+                ingress_compression=compression,
+            )
+            assert compressed["compression"] == compression
+            assert compressed["frame_size"] == compressed_count
+            assert compressed["uncompressed_proto_bytes"] > (
+                MAX_GET_PAGES_DECODING_MESSAGE_SIZE * 128
+            )
+            assert compressed["compressed_payload_bytes"] < MAX_GET_PAGES_DECODING_MESSAGE_SIZE
+            assert compressed["response_status"] is None
+            assert compressed["transport_status"] == "unimplemented"
+            assert not compressed["post_decode_reached"]
+            assert compressed["request_elapsed_ns"] > 0
+            emit_control_metric(
+                f"grpc_get_pages_{compression}_compressed_expansion_proto_bytes",
+                compressed["uncompressed_proto_bytes"],
+            )
+            emit_control_metric(
+                f"grpc_get_pages_{compression}_compressed_expansion_payload_bytes",
+                compressed["compressed_payload_bytes"],
+            )
+            emit_control_metric(
+                f"grpc_get_pages_{compression}_compressed_expansion_request_ns",
+                compressed["request_elapsed_ns"],
+            )
+
+        emit_control_metric(
+            "grpc_get_pages_identity_decoder_near_limit_proto_bytes",
+            below["uncompressed_proto_bytes"],
+        )
+        emit_control_metric(
+            "grpc_get_pages_identity_decoder_near_limit_vec_capacity_bytes",
+            below["decoded_block_numbers_capacity_bytes"],
+        )
+        emit_control_metric(
+            "grpc_get_pages_identity_decoder_near_limit_request_ns",
+            below["request_elapsed_ns"],
+        )
+        emit_control_metric(
+            "grpc_get_pages_identity_decoder_over_limit_request_ns",
+            above["request_elapsed_ns"],
+        )
+    finally:
+        client.configure_failpoints((failpoint, "off"))
+
+    assert metric(env, SMGR, filters) == before_timers
+    assert metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) == before_vectored
+    print("verified_grpc_get_pages_inbound_frame_bound")
+
+
 def assert_frame_holds_gc_cutoff(
     pg_bin: PgBin,
     neon_binpath: Path,
@@ -229,10 +378,17 @@ def assert_frame_holds_gc_cutoff(
     )
     assert before_cutoff <= request_lsn
 
-    failpoint = "ps::grpc-get-pages-between-chunks"
-    client.configure_failpoints((failpoint, "pause"))
+    frame_failpoint = "ps::grpc-get-pages-between-chunks"
+    gc_phase_failpoint = "timeline-gc-after-cutoff-store"
+    client.configure_failpoints((frame_failpoint, "pause"))
     _, configured_at = wait_until(
-        lambda: env.pageserver.assert_log_contains(f"cfg failpoint: {failpoint} pause"), timeout=20
+        lambda: env.pageserver.assert_log_contains(f"cfg failpoint: {frame_failpoint} pause"),
+        timeout=20,
+    )
+    client.configure_failpoints((gc_phase_failpoint, "return"))
+    _, gc_phase_configured_at = wait_until(
+        lambda: env.pageserver.assert_log_contains(f"cfg failpoint: {gc_phase_failpoint} return"),
+        timeout=20,
     )
     with ThreadPoolExecutor(max_workers=2) as executor:
         frame = executor.submit(
@@ -249,7 +405,7 @@ def assert_frame_holds_gc_cutoff(
         try:
             wait_until(
                 lambda: env.pageserver.assert_log_contains(
-                    f"at failpoint {failpoint}", configured_at
+                    f"at failpoint {frame_failpoint}", configured_at
                 ),
                 timeout=20,
             )
@@ -265,13 +421,20 @@ def assert_frame_holds_gc_cutoff(
                 > request_lsn,
                 timeout=20,
             )
-            # GC stores the new cutoff before waiting for pre-existing readers. If this frame
-            # dropped its RCU guard between chunks, GC can reach this log line while it is paused.
-            time.sleep(0.2)
-            assert not gc_completion.done()
-            assert env.pageserver.log_contains("GC starting", configured_at) is None
+            # This failpoint is evaluated after GC stores the new cutoff and before it awaits the
+            # RCU waitlist. The nonzero generation count proves the paused public frame still owns
+            # the old cutoff view at that precise lifecycle boundary; RcuWaitList::wait cannot
+            # complete until the frame is released below.
+            wait_until(
+                lambda: env.pageserver.assert_log_contains(
+                    r"GC cutoff stored before waiting for old readers; [1-9][0-9]* active reader generations",
+                    gc_phase_configured_at,
+                ),
+                timeout=20,
+            )
         finally:
-            client.configure_failpoints((failpoint, "off"))
+            client.configure_failpoints((frame_failpoint, "off"))
+            client.configure_failpoints((gc_phase_failpoint, "off"))
 
         assert_ok(frame.result(timeout=30), CAP + 1)
         assert gc_completion is not None
@@ -290,7 +453,7 @@ def test_grpc_get_pages_frame_contract(
         tenant_conf={"pitr_interval": "0 sec", "lsn_lease_length": "0s"},
     )
     env.pageserver.allowed_errors.append(
-        r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
+        r".*grpc:pageservice.*request failed with (Internal|InvalidArgument|OutOfRange|Unimplemented):.*"
     )
 
     direct_33, timer_starts_33, vectored_33, elapsed_33 = sample_direct_frame(
@@ -348,6 +511,7 @@ def test_grpc_get_pages_frame_contract(
         CAP,
         1,
     )
+    assert_inbound_frame_bound(pg_bin, neon_binpath, env, lsn, relation)
     assert_frame_holds_gc_cutoff(pg_bin, neon_binpath, env, endpoint, lsn, relation, table)
 
     for size, result, vectored_calls, elapsed_ns in (

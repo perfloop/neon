@@ -6915,6 +6915,13 @@ impl Timeline {
 
             write_guard.store_and_unlock(new_gc_cutoff)
         };
+        #[cfg(feature = "testing")]
+        let _ = fail::eval("timeline-gc-after-cutoff-store", |_| {
+            info!(
+                "GC cutoff stored before waiting for old readers; {} active reader generations",
+                waitlist.pending_reader_generations(),
+            );
+        });
         let waitlist_wait_fut = std::pin::pin!(waitlist.wait());
         log_slow(
             "applied_gc_cutoff waitlist wait",

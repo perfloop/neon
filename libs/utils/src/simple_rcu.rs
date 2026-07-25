@@ -196,6 +196,17 @@ impl<V> RcuWriteGuard<'_, V> {
 pub struct RcuWaitList(Vec<watch::Receiver<()>>);
 
 impl RcuWaitList {
+    /// Returns the number of old value generations still held by at least one reader.
+    ///
+    /// This is a point-in-time diagnostic: readers can release their guards immediately after the
+    /// call returns.
+    pub fn pending_reader_generations(&self) -> usize {
+        self.0
+            .iter()
+            .filter(|receiver| receiver.has_changed().is_ok())
+            .count()
+    }
+
     ///
     /// Wait for old readers to finish.
     ///

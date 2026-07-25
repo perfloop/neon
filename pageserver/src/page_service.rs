@@ -134,6 +134,13 @@ const MAX_GET_PAGES_RESPONSE_PAGES: usize = (GRPC_MAX_ENCODING_MESSAGE_SIZE
     - GET_PAGES_RESPONSE_FIXED_WIRE_BYTES)
     / GET_PAGES_RESPONSE_PAGE_WIRE_BYTES;
 
+// The public response limit permits this many requested blocks. A GetPageRequest with every
+// possible fixed field at its maximum encoded width uses 80 bytes; an unpacked maximum-width
+// uint32 block number uses six bytes. Tonic applies this cap to an identity gRPC body before
+// Prost allocates the repeated block-number Vec. The PageService-wide cap also covers its other
+// request messages, whose fields are all fixed-size and substantially smaller.
+const GRPC_MAX_GET_PAGES_DECODING_MESSAGE_SIZE: usize = MAX_GET_PAGES_RESPONSE_PAGES * 6 + 80;
+
 ///////////////////////////////////////////////////////////////////////////////
 
 pub struct Listener {
@@ -3406,9 +3413,11 @@ impl GrpcPageServiceHandler {
             .service(
                 proto::PageServiceServer::new(page_service_handler)
                     .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE)
-                    // Support both gzip and zstd compression. The client decides what to use.
-                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-                    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+                    // Incoming PageService frames use identity encoding. In Tonic 0.13, a receive
+                    // limit is applied to compressed bytes before decompression, so accepting gzip
+                    // or zstd here would let a compressed request bypass this GetPages allocation
+                    // bound. Responses may still use either encoding.
+                    .max_decoding_message_size(GRPC_MAX_GET_PAGES_DECODING_MESSAGE_SIZE)
                     .send_compressed(tonic::codec::CompressionEncoding::Gzip)
                     .send_compressed(tonic::codec::CompressionEncoding::Zstd),
             );
@@ -4038,6 +4047,14 @@ impl proto::PageService for GrpcPageServiceHandler {
                 // Process the request, using a closure to capture errors.
                 let process_request = async || {
                     let req = page_api::GetPageRequest::try_from(req)?;
+                    #[cfg(feature = "testing")]
+                    if fail::eval("ps::grpc-get-pages-after-decode", |_| ()).is_some() {
+                        return Err(tonic::Status::invalid_argument(format!(
+                            "injected GetPages post-decode frame: blocks={}, capacity_bytes={}",
+                            req.block_numbers.len(),
+                            req.block_numbers.capacity() * std::mem::size_of::<u32>(),
+                        )));
+                    }
                     // Keep this on the original public frame: stale-parent routing splits it into
                     // child requests below, but still reassembles one response for the stream.
                     if req.block_numbers.len() > MAX_GET_PAGES_RESPONSE_PAGES {

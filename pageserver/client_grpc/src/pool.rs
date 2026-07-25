@@ -231,7 +231,7 @@ pub struct ClientPool {
     shard_id: ShardIndex,
     /// Authentication token, if any.
     auth_token: Option<String>,
-    /// Compression to use.
+    /// Response compression to accept.
     compression: Option<CompressionEncoding>,
     /// Channel pool to acquire channels from.
     channel_pool: Arc<ChannelPool>,
