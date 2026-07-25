@@ -4467,6 +4467,7 @@ dependencies = [
  "pageserver_client_grpc",
  "pageserver_page_api",
  "pprof",
+ "prost 0.13.5",
  "rand 0.9.1",
  "reqwest",
  "serde",

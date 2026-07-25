@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -89,6 +90,7 @@ def run(
     *,
     repeat_block: int | None = None,
     suffix_block: int | None = None,
+    recovery_block: int | None = None,
     start_block: int = 0,
     shard_number: int = 0,
     shard_count: int = 0,
@@ -128,6 +130,8 @@ def run(
         command.extend(("--repeat-block", str(repeat_block)))
     if suffix_block is not None:
         command.extend(("--suffix-block", str(suffix_block)))
+    if recovery_block is not None:
+        command.extend(("--recovery-block", str(recovery_block)))
     basepath = pg_bin.run_capture(command, with_command_header=False)
     result = json.loads(Path(basepath + ".stdout").read_text())
     assert isinstance(result, dict), result
@@ -138,17 +142,6 @@ def assert_ok(result: dict[str, Any], size: int) -> None:
     assert result["status"] == "ok" and result["reason"] is None
     assert result["response_pages"] == size
     assert result["request_id_matches"] and result["image_byte_mismatches"] == 0
-
-
-def direct_frame_completed(result: dict[str, Any], size: int) -> bool:
-    if result["status"] == "ok":
-        assert_ok(result, size)
-        return True
-    assert result["status"] == "internal_error"
-    assert result["reason"] == "Read error"
-    assert result["response_pages"] == 0
-    assert result["request_id_matches"] and result["image_byte_mismatches"] == 0
-    return False
 
 
 def frame_filters(env: NeonEnv) -> dict[str, str]:
@@ -304,10 +297,6 @@ def test_grpc_get_pages_frame_contract(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
     )
 
-    if not direct_frame_completed(run(pg_bin, neon_binpath, env, lsn, relation, 100, "raw"), 100):
-        print("legacy_fallback_completed")
-        return
-    print("direct_completed")
     direct_33, timer_starts_33, vectored_33, elapsed_33 = sample_direct_frame(
         pg_bin, neon_binpath, env, lsn, relation, CAP + 1
     )
@@ -363,6 +352,7 @@ def test_grpc_get_pages_frame_contract(
         CAP,
         1,
     )
+    assert_inbound_frame_bound(pg_bin, neon_binpath, env, lsn, relation)
     assert_frame_holds_gc_cutoff(pg_bin, neon_binpath, env, endpoint, lsn, relation, table)
 
     for size, result, vectored_calls, elapsed_ns in (
@@ -391,10 +381,7 @@ def test_grpc_get_pages_stale_parent_frame_contract(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
     )
     direct = run(pg_bin, neon_binpath, env, lsn, relation, 100, "raw")
-    if not direct_frame_completed(direct, 100):
-        print("legacy_fallback_completed")
-        return
-    print("direct_completed")
+    assert_ok(direct, 100)
 
     env.storage_controller.tenant_shard_split(env.initial_tenant, shard_count=8)
     assert not env.pageserver.tenant_dir(TenantShardId(env.initial_tenant, 0, 1)).exists()
@@ -427,6 +414,73 @@ def test_grpc_get_pages_stale_parent_frame_contract(
     print("verified_grpc_get_pages_stale_parent_frame_contract")
 
 
+def assert_inbound_frame_bound(
+    pg_bin: PgBin,
+    neon_binpath: Path,
+    env: NeonEnv,
+    lsn: Lsn,
+    relation: tuple[int, int, int],
+):
+    filters = frame_filters(env)
+    before_timers = metric(env, SMGR, filters)
+    before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
+    inbound = run(
+        pg_bin,
+        neon_binpath,
+        env,
+        lsn,
+        relation,
+        1024,
+        "inbound",
+        repeat_block=(1 << 32) - 1,
+    )
+    assert inbound["stream_status"] == "OutOfRange"
+    limit_match = re.search(r"limit is: (\d+) bytes", inbound["stream_message"])
+    assert limit_match is not None, inbound
+    decoder_limit = int(limit_match.group(1))
+    assert inbound["inbound_wire_bytes"] > decoder_limit
+    assert metric(env, SMGR, filters) - before_timers == 0
+    assert metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored == 0
+
+    following = run(pg_bin, neon_binpath, env, lsn, relation, CAP, "probe")
+    assert_ok(following, CAP)
+    assert (
+        metric(env, SMGR, filters) - before_timers,
+        metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored,
+    ) == (CAP, 1)
+
+    before_timers = metric(env, SMGR, filters)
+    before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
+    near_limit = run(
+        pg_bin,
+        neon_binpath,
+        env,
+        lsn,
+        relation,
+        768,
+        "bounded",
+        repeat_block=(1 << 32) - 1,
+        recovery_block=0,
+    )
+    assert decoder_limit * 0.9 < near_limit["oversized_wire_bytes"] < decoder_limit
+    assert near_limit["oversized_status"] == "invalid_request"
+    assert near_limit["oversized_reason"] == (
+        f"GetPages request has 768 blocks, limit is {MAX_RESPONSE_PAGES}"
+    )
+    assert near_limit["oversized_pages"] == 0
+    assert near_limit["following_pages"] == CAP
+    assert near_limit["following_image_byte_mismatches"] == 0
+    assert near_limit["oversized_elapsed_ns"] > 0
+    assert (
+        metric(env, SMGR, filters) - before_timers,
+        metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored,
+    ) == (near_limit["reference_pages"] + CAP, 2)
+    print(
+        "verified_grpc_get_pages_inbound_frame_bound "
+        f"decoder_limit={decoder_limit} near_limit_elapsed_ns={near_limit['oversized_elapsed_ns']}"
+    )
+
+
 def test_grpc_get_pages_child_suffix_frame_contract(
     neon_env_builder: NeonEnvBuilder, neon_binpath: Path, pg_bin: PgBin
 ):
@@ -439,10 +493,7 @@ def test_grpc_get_pages_child_suffix_frame_contract(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument):.*"
     )
     direct = run(pg_bin, neon_binpath, env, lsn, relation, 100, "raw")
-    if not direct_frame_completed(direct, 100):
-        print("legacy_fallback_completed")
-        return
-    print("direct_completed")
+    assert_ok(direct, 100)
 
     env.storage_controller.tenant_shard_split(env.initial_tenant, shard_count=8)
     local_block = None
