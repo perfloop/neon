@@ -144,10 +144,12 @@ const MAX_GET_PAGES_RESPONSE_PAGES: usize = (GRPC_MAX_ENCODING_MESSAGE_SIZE
 // enforces this decoded-message cap on GetPages before Tonic/Prost can materialize the repeated
 // block-number Vec. Other PageService methods retain Tonic's ordinary inbound-message policy.
 const GRPC_MAX_GET_PAGES_DECODING_MESSAGE_SIZE: usize = MAX_GET_PAGES_RESPONSE_PAGES * 7 + 80;
-// Tonic 0.13's default receive limit is 4 MiB. Retaining that established wire cap means a
-// compression-configured client is not newly rejected for encoding overhead, while the layer's
-// decoded GetPages cap prevents a compressed frame from expanding into a large protobuf Vec.
-const GRPC_MAX_COMPRESSED_REQUEST_MESSAGE_SIZE: usize = GRPC_MAX_ENCODING_MESSAGE_SIZE;
+// GetPages accepts at most 3,657 decoded protobuf bytes. Four KiB leaves 439 bytes for the
+// gzip/zstd framing overhead produced by established clients while keeping the compressed input
+// buffer proportional to the public frame rather than Tonic's 4 MiB default. At the server's 256
+// concurrent-stream limit, incomplete accepted GetPages envelopes therefore retain at most 1 MiB
+// of wire payload before the bounded decoder runs.
+const GRPC_MAX_COMPRESSED_REQUEST_MESSAGE_SIZE: usize = 4 * 1024;
 
 ///////////////////////////////////////////////////////////////////////////////
 

@@ -7,6 +7,7 @@
 //! decoded sizes, and passes an identity-framed message to Tonic.
 
 use std::io::Read;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 #[cfg(feature = "testing")]
 use std::time::Instant;
@@ -14,7 +15,7 @@ use std::time::Instant;
 use bytes::{Buf, Bytes, BytesMut};
 use http_body::Frame;
 use http_body_util::StreamBody;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::codegen::Body as HttpBody;
 use tonic::{Status, body::Body, codegen::Service};
@@ -60,6 +61,10 @@ pub(crate) struct BoundedGrpcRequestCompression<S> {
     inner: S,
     max_decoded_message_size: usize,
     max_compressed_message_size: usize,
+    // GetPages streams can be numerous. Bound active decompression so queued streams retain only
+    // their incrementally-filled <=4 KiB wire payload instead of every stream allocating a codec
+    // window concurrently.
+    decompression_limiter: Arc<Semaphore>,
 }
 
 impl<S> BoundedGrpcRequestCompression<S> {
@@ -72,6 +77,7 @@ impl<S> BoundedGrpcRequestCompression<S> {
             inner,
             max_decoded_message_size,
             max_compressed_message_size,
+            decompression_limiter: new_decompression_limiter(),
         }
     }
 }
@@ -97,18 +103,45 @@ where
     }
 
     fn call(&mut self, req: http::Request<B>) -> Self::Future {
-        self.inner.call(transform_request(
+        self.inner.call(transform_request_with_limiter(
             req,
             self.max_decoded_message_size,
             self.max_compressed_message_size,
+            self.decompression_limiter.clone(),
         ))
     }
 }
 
+fn new_decompression_limiter() -> Arc<Semaphore> {
+    // PageService runs on the configured compute-request runtime. This bounds simultaneously
+    // active decoder windows to that runtime's worker ceiling; queued streams retain only their
+    // bounded wire payloads.
+    Arc::new(Semaphore::new(crate::task_mgr::TOKIO_WORKER_THREADS.get()))
+}
+
+#[cfg(test)]
 fn transform_request<B>(
     req: http::Request<B>,
     max_decoded_message_size: usize,
     max_compressed_message_size: usize,
+) -> http::Request<Body>
+where
+    B: HttpBody<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError> + Send + 'static,
+{
+    transform_request_with_limiter(
+        req,
+        max_decoded_message_size,
+        max_compressed_message_size,
+        new_decompression_limiter(),
+    )
+}
+
+fn transform_request_with_limiter<B>(
+    req: http::Request<B>,
+    max_decoded_message_size: usize,
+    max_compressed_message_size: usize,
+    decompression_limiter: Arc<Semaphore>,
 ) -> http::Request<Body>
 where
     B: HttpBody<Data = Bytes> + Send + 'static,
@@ -157,18 +190,20 @@ where
     // bounded to one also prevents a fast peer from retaining several maximum-size wire frames
     // while the GetPages handler is working on the first request.
     let (tx, rx) = mpsc::channel(1);
-    tokio::spawn(forward_frames(
+    tokio::spawn(forward_frames_with_limiter(
         body,
         tx,
         encoding,
         max_decoded_message_size,
         max_compressed_message_size,
+        decompression_limiter,
         observation,
     ));
     let body = Body::new(StreamBody::new(ReceiverStream::new(rx)));
     http::Request::from_parts(parts, body)
 }
 
+#[cfg(test)]
 async fn forward_frames<B>(
     body: B,
     tx: mpsc::Sender<Result<Frame<Bytes>, Status>>,
@@ -180,10 +215,35 @@ async fn forward_frames<B>(
     B: HttpBody<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError> + Send + 'static,
 {
+    forward_frames_with_limiter(
+        body,
+        tx,
+        encoding,
+        max_decoded_message_size,
+        max_compressed_message_size,
+        new_decompression_limiter(),
+        observation,
+    )
+    .await
+}
+
+async fn forward_frames_with_limiter<B>(
+    body: B,
+    tx: mpsc::Sender<Result<Frame<Bytes>, Status>>,
+    encoding: Option<Encoding>,
+    max_decoded_message_size: usize,
+    max_compressed_message_size: usize,
+    decompression_limiter: Arc<Semaphore>,
+    observation: Observation,
+) where
+    B: HttpBody<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError> + Send + 'static,
+{
     let mut decoder = GrpcFrameDecoder::new(
         encoding,
         max_decoded_message_size,
         max_compressed_message_size,
+        decompression_limiter,
         observation,
     );
     let mut body = std::pin::pin!(body);
@@ -238,6 +298,7 @@ struct GrpcFrameDecoder {
     encoding: Option<Encoding>,
     max_decoded_message_size: usize,
     max_compressed_message_size: usize,
+    decompression_limiter: Arc<Semaphore>,
     header: [u8; GRPC_HEADER_SIZE],
     header_len: usize,
     payload: BytesMut,
@@ -251,6 +312,7 @@ impl GrpcFrameDecoder {
         encoding: Option<Encoding>,
         max_decoded_message_size: usize,
         max_compressed_message_size: usize,
+        decompression_limiter: Arc<Semaphore>,
         observation: Observation,
     ) -> Self {
         #[cfg(not(feature = "testing"))]
@@ -259,6 +321,7 @@ impl GrpcFrameDecoder {
             encoding,
             max_decoded_message_size,
             max_compressed_message_size,
+            decompression_limiter,
             header: [0; GRPC_HEADER_SIZE],
             header_len: 0,
             payload: BytesMut::new(),
@@ -300,9 +363,9 @@ impl GrpcFrameDecoder {
 
                 #[cfg(feature = "testing")]
                 if let Some(observation) = &self.observation {
-                    // Start elapsed-time observation before ingress buffering. The allocation
-                    // counter itself is sampled only around synchronous decompression below, so it
-                    // cannot be perturbed by later async protobuf handling.
+                    // Start before body buffering. Allocation samples below cover every
+                    // synchronous ingress operation through identity-frame reconstruction, and
+                    // deliberately exclude later asynchronous protobuf handling.
                     observation.begin();
                 }
 
@@ -315,13 +378,19 @@ impl GrpcFrameDecoder {
                 if len > limit {
                     return Err(self.limit_status(flag == GRPC_COMPRESSION_FLAG_COMPRESSED));
                 }
-                self.payload.reserve(len);
+                // Do not reserve from a peer-controlled header. `BytesMut` grows only as DATA
+                // arrives, so a peer that declares an accepted frame and stalls retains no
+                // maximum-frame allocation merely from this envelope header.
                 self.expected_payload_len = Some(len);
             }
 
             let expected = self.expected_payload_len.expect("set after gRPC header");
             let take = (expected - self.payload.len()).min(data.remaining());
+            #[cfg(feature = "testing")]
+            let allocated_before = self.thread_allocated_before();
             self.payload.extend_from_slice(&data[..take]);
+            #[cfg(feature = "testing")]
+            self.record_thread_allocation_since(allocated_before);
             data.advance(take);
             if self.payload.len() != expected {
                 continue;
@@ -329,7 +398,14 @@ impl GrpcFrameDecoder {
 
             let compressed = self.header[0] == GRPC_COMPRESSION_FLAG_COMPRESSED;
             let payload = if compressed {
-                let payload = self.decompress()?;
+                let permit = self.acquire_decompression_permit(tx).await?;
+                #[cfg(feature = "testing")]
+                let allocated_before = self.thread_allocated_before();
+                let result = self.decompress();
+                #[cfg(feature = "testing")]
+                self.record_thread_allocation_since(allocated_before);
+                drop(permit);
+                let payload = result?;
                 if payload.len() > self.max_decoded_message_size {
                     return Err(self.limit_status(true));
                 }
@@ -343,10 +419,18 @@ impl GrpcFrameDecoder {
         Ok(())
     }
 
-    fn decompress(&mut self) -> Result<Bytes, Status> {
-        #[cfg(feature = "testing")]
-        let allocated_before = thread_allocated_bytes();
+    async fn acquire_decompression_permit(
+        &self,
+        tx: &mpsc::Sender<Result<Frame<Bytes>, Status>>,
+    ) -> Result<OwnedSemaphorePermit, Status> {
+        tokio::select! {
+            _ = tx.closed() => Err(Status::cancelled("gRPC request consumer closed")),
+            permit = self.decompression_limiter.clone().acquire_owned() => permit
+                .map_err(|_| Status::internal("PageService decompression limiter closed")),
+        }
+    }
 
+    fn decompress(&mut self) -> Result<Bytes, Status> {
         let mut output = Vec::with_capacity(self.max_decoded_message_size.min(self.payload.len()));
         let limit = (self.max_decoded_message_size + 1) as u64;
         let result = match self.encoding.expect("compressed flag requires encoding") {
@@ -375,19 +459,6 @@ impl GrpcFrameDecoder {
             Status::internal(format!("invalid compressed gRPC request: {error}"))
         })?;
 
-        #[cfg(feature = "testing")]
-        if let (Some(observation), Some(allocated_before), Some(allocated_after)) = (
-            &self.observation,
-            allocated_before,
-            thread_allocated_bytes(),
-        ) {
-            // Both reads and decompression run without an await in this forwarding task. Unlike a
-            // process-wide allocation gauge, this cumulative thread counter cannot be perturbed
-            // by a different async task while this bounded decoder is executing.
-            observation
-                .record_ingress_thread_allocation(allocated_after.saturating_sub(allocated_before));
-        }
-
         Ok(Bytes::from(output))
     }
 
@@ -396,13 +467,39 @@ impl GrpcFrameDecoder {
         payload: Bytes,
         tx: &mpsc::Sender<Result<Frame<Bytes>, Status>>,
     ) -> Result<(), Status> {
+        #[cfg(feature = "testing")]
+        let allocated_before = self.thread_allocated_before();
         let mut frame = BytesMut::with_capacity(GRPC_HEADER_SIZE + payload.len());
         frame.extend_from_slice(&[GRPC_COMPRESSION_FLAG_UNCOMPRESSED]);
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
+        #[cfg(feature = "testing")]
+        self.record_thread_allocation_since(allocated_before);
         tx.send(Ok(Frame::data(frame.freeze())))
             .await
             .map_err(|_| Status::cancelled("gRPC request consumer closed"))
+    }
+
+    #[cfg(feature = "testing")]
+    fn thread_allocated_before(&self) -> Option<u64> {
+        self.observation
+            .as_ref()
+            .and_then(|_| thread_allocated_bytes())
+    }
+
+    #[cfg(feature = "testing")]
+    fn record_thread_allocation_since(&self, allocated_before: Option<u64>) {
+        if let (Some(observation), Some(allocated_before), Some(allocated_after)) = (
+            &self.observation,
+            allocated_before,
+            thread_allocated_bytes(),
+        ) {
+            // This covers a synchronous portion of the forwarding task. Sampling only on one
+            // side of an await keeps a cumulative per-thread counter from being attributed to a
+            // task after it migrates between Tokio workers.
+            observation
+                .record_ingress_thread_allocation(allocated_after.saturating_sub(allocated_before));
+        }
     }
 
     fn limit_status(&self, compressed: bool) -> Status {
@@ -459,8 +556,9 @@ struct IngressObservationState {
 
 #[cfg(feature = "testing")]
 pub(crate) struct IngressMeasurement {
-    /// Cumulative allocations made by the forwarding task while synchronously decompressing this
-    /// gRPC message. This deliberately excludes unrelated tasks and later Prost allocations.
+    /// Cumulative allocations made by synchronous portions of the forwarding task from wire-body
+    /// buffering through bounded decompression and identity-frame reconstruction. This deliberately
+    /// excludes unrelated tasks and later Prost allocations.
     pub(crate) ingress_thread_allocated_bytes: u64,
     pub(crate) ingress_thread_allocation_observed: bool,
     pub(crate) elapsed_ns: u128,
@@ -479,6 +577,9 @@ impl IngressObservation {
         if state.started_at.is_none() {
             state.started_at = Some(Instant::now());
         }
+        // Mark that this test process can sample the same forwarding task even when the envelope
+        // is rejected from its header before it needs to grow a payload buffer.
+        state.ingress_thread_allocation_observed |= thread_allocated_bytes().is_some();
     }
 
     fn record_ingress_thread_allocation(&self, bytes: u64) {
@@ -522,6 +623,7 @@ fn thread_allocated_bytes() -> Option<u64> {
 mod tests {
     use std::convert::Infallible;
     use std::io::Write;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::{Bytes, BytesMut};
@@ -529,12 +631,12 @@ mod tests {
     use futures::{StreamExt, stream};
     use http_body::Frame;
     use http_body_util::{BodyExt, Full, StreamBody};
-    use tokio::sync::mpsc;
+    use tokio::sync::{Semaphore, mpsc};
     use tonic::body::Body;
 
     use super::{
-        GET_PAGES_PATH, GRPC_ENCODING_HEADER, MAX_ZSTD_WINDOW_LOG, forward_frames,
-        transform_request,
+        GET_PAGES_PATH, GRPC_ENCODING_HEADER, GrpcFrameDecoder, MAX_ZSTD_WINDOW_LOG,
+        forward_frames, transform_request,
     };
 
     fn grpc_frame(flag: u8, payload: &[u8]) -> Bytes {
@@ -723,6 +825,36 @@ mod tests {
             .await
             .expect("forwarding task must observe receiver cancellation")
             .expect("forwarding task should not panic");
+    }
+
+    #[tokio::test]
+    async fn compressed_decoder_waits_for_the_shared_limiter() {
+        // A compressed frame must not create another decoder window while an earlier stream owns
+        // the shared permit. This is the aggregation bound for many concurrent GetPages streams.
+        let limiter = Arc::new(Semaphore::new(1));
+        let decoder =
+            GrpcFrameDecoder::new(Some(super::Encoding::Gzip), 16, 64, limiter.clone(), ());
+        let held = limiter.clone().acquire_owned().await.unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                decoder.acquire_decompression_permit(&tx),
+            )
+            .await
+            .is_err()
+        );
+
+        drop(held);
+        let permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            decoder.acquire_decompression_permit(&tx),
+        )
+        .await
+        .expect("shared decoder permit should become available")
+        .expect("limiter should remain open");
+        drop(permit);
     }
 
     #[tokio::test]

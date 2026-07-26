@@ -19,9 +19,10 @@ if TYPE_CHECKING:
 CAP = 32
 MAX_RESPONSE_PAGES = 511
 MAX_GET_PAGES_DECODING_MESSAGE_SIZE = MAX_RESPONSE_PAGES * 7 + 80
-# The bounded zstd decoder permits a 2 MiB window. This 4 MiB cap leaves space for its observed
-# workspace and the bounded output buffer while still failing if an ingress decoder regresses to a
-# much larger allocation before protobuf materialization.
+MAX_COMPRESSED_GET_PAGES_WIRE_BYTES = 4 * 1024
+# The wire cap is 4 KiB, but the bounded zstd decoder permits a 2 MiB window. This conservative
+# 4 MiB per-active-decoder ceiling leaves room for its observed workspace and bounded output while
+# still failing if ingress regresses to a much larger allocation before protobuf materialization.
 MAX_INGRESS_DECOMPRESSION_THREAD_ALLOCATION_BYTES = 4 * 1024 * 1024
 SMGR = "pageserver_smgr_query_started_count_total"
 VECTORED = "pageserver_get_vectored_seconds_count"
@@ -116,6 +117,7 @@ def run(
     shard_count: int = 0,
     ingress_compression: str = "identity",
     client_compression: str = "identity",
+    ingress_wire_target_bytes: int | None = None,
 ) -> dict[str, Any]:
     dbnode, spcnode, relnode = relation
     binary = frame_contract_binary(neon_binpath)
@@ -156,6 +158,8 @@ def run(
         command.extend(("--repeat-block", str(repeat_block)))
     if suffix_block is not None:
         command.extend(("--suffix-block", str(suffix_block)))
+    if ingress_wire_target_bytes is not None:
+        command.extend(("--ingress-wire-target-bytes", str(ingress_wire_target_bytes)))
     basepath = pg_bin.run_capture(command, with_command_header=False)
     result = json.loads(Path(basepath + ".stdout").read_text())
     assert isinstance(result, dict), result
@@ -264,8 +268,10 @@ def assert_inbound_frame_bound(
                 <= result["server_ingress_thread_allocated_bytes"]
                 <= MAX_INGRESS_DECOMPRESSION_THREAD_ALLOCATION_BYTES
             ), result
-            if result["compression"] != "identity":
-                assert result["server_ingress_thread_allocation_observed"] is True, result
+            # Identity is sampled across its actual payload buffering and rewritten envelope too;
+            # a zero delta is meaningful only after the server confirms that task-local allocation
+            # observation was available.
+            assert result["server_ingress_thread_allocation_observed"] is True, result
             assert isinstance(result["server_elapsed_ns"], int), result
             assert result["server_elapsed_ns"] > 0, result
 
@@ -358,6 +364,10 @@ def assert_inbound_frame_bound(
         assert below["decoded_block_numbers_capacity_bytes"] >= below_count * 4
         assert below["request_elapsed_ns"] > 0
         assert_server_observation(below)
+        # The identity control includes actual bounded payload growth and the rewritten output
+        # envelope in the forwarding-task sample, so it must not silently collapse to an
+        # unobserved zero as it did when only `decompress` was sampled.
+        assert below["server_ingress_thread_allocated_bytes"] > 0
         assert above["response_status"] is None
         assert above["transport_status"] == "out_of_range"
         assert not above["post_decode_reached"]
@@ -418,6 +428,71 @@ def assert_inbound_frame_bound(
                 )
                 emit_control_metric(
                     f"grpc_get_pages_{compression}_decoder_{boundary}_request_ns",
+                    result["request_elapsed_ns"],
+                )
+
+        # Hand-frame valid gzip/zstd messages immediately below and above the independent
+        # compressed-wire cap. Padding uses legal gzip FEXTRA members or a legal zstd skippable
+        # frame, so the decoded protobuf remains small while this path measures the full body
+        # buffer, bounded decoder, and rewritten identity frame rather than only the generated
+        # client's normally tiny compressed payload.
+        for compression in ("gzip", "zstd"):
+            near_wire = run(
+                pg_bin,
+                neon_binpath,
+                env,
+                lsn,
+                relation,
+                1,
+                "ingress",
+                ingress_compression=compression,
+                ingress_wire_target_bytes=MAX_COMPRESSED_GET_PAGES_WIRE_BYTES - 1,
+            )
+            over_wire = run(
+                pg_bin,
+                neon_binpath,
+                env,
+                lsn,
+                relation,
+                1,
+                "ingress",
+                ingress_compression=compression,
+                ingress_wire_target_bytes=MAX_COMPRESSED_GET_PAGES_WIRE_BYTES + 1,
+            )
+            assert near_wire["wire_padded"] is True
+            assert near_wire["compressed_payload_bytes"] >= (
+                MAX_COMPRESSED_GET_PAGES_WIRE_BYTES - 21
+            )
+            assert near_wire["compressed_payload_bytes"] < MAX_COMPRESSED_GET_PAGES_WIRE_BYTES
+            assert near_wire["uncompressed_proto_bytes"] <= MAX_GET_PAGES_DECODING_MESSAGE_SIZE
+            assert near_wire["response_status"] == "invalid_request"
+            assert near_wire["response_pages"] == 0
+            assert near_wire["transport_status"] is None
+            assert near_wire["post_decode_reached"]
+            assert near_wire["post_decode_blocks"] == 1
+            assert_server_observation(near_wire)
+            assert near_wire["server_ingress_thread_allocated_bytes"] > 0
+            assert over_wire["wire_padded"] is True
+            assert over_wire["compressed_payload_bytes"] > MAX_COMPRESSED_GET_PAGES_WIRE_BYTES
+            assert over_wire["response_status"] is None
+            assert over_wire["transport_status"] == "out_of_range"
+            assert not over_wire["post_decode_reached"]
+            assert_server_observation(over_wire)
+            for boundary, result in (("near_limit", near_wire), ("over_limit", over_wire)):
+                emit_control_metric(
+                    f"grpc_get_pages_{compression}_wire_{boundary}_payload_bytes",
+                    result["compressed_payload_bytes"],
+                )
+                emit_control_metric(
+                    f"grpc_get_pages_{compression}_wire_{boundary}_server_ingress_thread_allocated_bytes",
+                    result["server_ingress_thread_allocated_bytes"],
+                )
+                emit_control_metric(
+                    f"grpc_get_pages_{compression}_wire_{boundary}_server_elapsed_ns",
+                    result["server_elapsed_ns"],
+                )
+                emit_control_metric(
+                    f"grpc_get_pages_{compression}_wire_{boundary}_request_ns",
                     result["request_elapsed_ns"],
                 )
 
@@ -618,6 +693,19 @@ def test_grpc_get_pages_frame_contract(
     warmup = run(pg_bin, neon_binpath, env, lsn, relation, 1, "raw")
     assert_ok(warmup, 1)
 
+    # Measure the same resident direct-frame destinations for every supported wire encoding. The
+    # matching identity controls ensure the compression wrapper's no-compression path is priced
+    # alongside gzip and zstd rather than only at the separate 511-page boundary.
+    direct_33_identity, timer_starts_33_identity, vectored_33_identity, elapsed_33_identity = (
+        sample_direct_frame(pg_bin, neon_binpath, env, lsn, relation, CAP + 1)
+    )
+    direct_100_identity, timer_starts_100_identity, vectored_100_identity, elapsed_100_identity = (
+        sample_direct_frame(pg_bin, neon_binpath, env, lsn, relation, 100)
+    )
+    direct_255_identity, timer_starts_255_identity, vectored_255_identity, elapsed_255_identity = (
+        sample_direct_frame(pg_bin, neon_binpath, env, lsn, relation, 255, repeat_block=0)
+    )
+
     # Exercise established compressed GetPages clients on the successful over-cap destinations.
     # The helper's typed client both sends compressed requests and accepts compressed responses.
     direct_33, timer_starts_33, vectored_33, elapsed_33 = sample_direct_frame(
@@ -662,6 +750,9 @@ def test_grpc_get_pages_frame_contract(
     )
 
     for result, size in (
+        (direct_33_identity, CAP + 1),
+        (direct_100_identity, 100),
+        (direct_255_identity, 255),
         (direct_33, CAP + 1),
         (direct_33_gzip, CAP + 1),
         (direct_100, 100),
@@ -671,11 +762,15 @@ def test_grpc_get_pages_frame_contract(
         (direct_at_limit, MAX_RESPONSE_PAGES),
     ):
         assert_ok(result, size)
+    for result in (direct_33_identity, direct_100_identity, direct_255_identity, direct_at_limit):
+        assert result["client_compression"] == "identity"
     for result in (direct_33, direct_100, direct_255):
         assert result["client_compression"] == "zstd"
     for result in (direct_33_gzip, direct_100_gzip, direct_255_gzip):
         assert result["client_compression"] == "gzip"
-    assert direct_at_limit["client_compression"] == "identity"
+    assert (timer_starts_33_identity, vectored_33_identity) == (CAP + 1, 2)
+    assert (timer_starts_100_identity, vectored_100_identity) == (100, 4)
+    assert (timer_starts_255_identity, vectored_255_identity) == (255, 8)
     assert (timer_starts_33, vectored_33) == (CAP + 1, 2)
     assert (timer_starts_33_gzip, vectored_33_gzip) == (CAP + 1, 2)
     assert (timer_starts_100, vectored_100) == (100, 4)
@@ -712,16 +807,30 @@ def test_grpc_get_pages_frame_contract(
     assert_frame_holds_gc_cutoff(pg_bin, neon_binpath, env, endpoint, lsn, relation, table)
 
     for size, result, vectored_calls, elapsed_ns in (
-        (CAP + 1, direct_33, vectored_33, elapsed_33),
-        (100, direct_100, vectored_100, elapsed_100),
-        (255, direct_255, vectored_255, elapsed_255),
+        (CAP + 1, direct_33_identity, vectored_33_identity, elapsed_33_identity),
+        (100, direct_100_identity, vectored_100_identity, elapsed_100_identity),
+        (255, direct_255_identity, vectored_255_identity, elapsed_255_identity),
         (MAX_RESPONSE_PAGES, direct_at_limit, vectored_511, elapsed_511),
     ):
         emit_control_metric(
-            f"grpc_get_pages_direct_{size}_returned_pages", result["response_pages"]
+            f"grpc_get_pages_identity_direct_{size}_returned_pages", result["response_pages"]
         )
-        emit_control_metric(f"server_get_vectored_calls_per_direct_{size}_frame", vectored_calls)
-        emit_control_metric(f"grpc_get_pages_direct_{size}_request_ns", elapsed_ns)
+        emit_control_metric(
+            f"server_get_vectored_calls_per_identity_direct_{size}_frame", vectored_calls
+        )
+        emit_control_metric(f"grpc_get_pages_identity_direct_{size}_request_ns", elapsed_ns)
+    for size, result, vectored_calls, elapsed_ns in (
+        (CAP + 1, direct_33, vectored_33, elapsed_33),
+        (100, direct_100, vectored_100, elapsed_100),
+        (255, direct_255, vectored_255, elapsed_255),
+    ):
+        emit_control_metric(
+            f"grpc_get_pages_zstd_direct_{size}_returned_pages", result["response_pages"]
+        )
+        emit_control_metric(
+            f"server_get_vectored_calls_per_zstd_direct_{size}_frame", vectored_calls
+        )
+        emit_control_metric(f"grpc_get_pages_zstd_direct_{size}_request_ns", elapsed_ns)
     for size, result, vectored_calls, elapsed_ns in (
         (CAP + 1, direct_33_gzip, vectored_33_gzip, elapsed_33_gzip),
         (100, direct_100_gzip, vectored_100_gzip, elapsed_100_gzip),
