@@ -198,8 +198,9 @@ pub struct RcuWaitList(Vec<watch::Receiver<()>>);
 impl RcuWaitList {
     /// Returns the number of old value generations still held by at least one reader.
     ///
-    /// This is a point-in-time diagnostic: readers can release their guards immediately after the
-    /// call returns.
+    /// This is a point-in-time diagnostic for test-only lifecycle assertions: readers can release
+    /// their guards immediately after the call returns.
+    #[cfg(feature = "testing")]
     pub fn pending_reader_generations(&self) -> usize {
         self.0
             .iter()

@@ -115,6 +115,7 @@ hmac = "0.12.1"
 hostname = "0.4"
 http = {version = "1.1.0", features = ["std"]}
 http-types = { version = "2", default-features = false }
+http-body = "1.0"
 http-body-util = "0.1.2"
 humantime = "2.2"
 humantime-serde = "1.1.1"
@@ -213,6 +214,7 @@ toml_edit = "0.22"
 tonic = { version = "0.13.1", default-features = false, features = ["channel", "codegen", "gzip", "prost", "router", "server", "tls-ring", "tls-native-roots", "zstd"] }
 tonic-reflection = { version = "0.13.1", features = ["server"] }
 tower = { version = "0.5.2", default-features = false }
+zstd = "0.13"
 tower-http = { version = "0.6.2", features = ["auth", "request-id", "trace"] }
 tower-otel = { version = "0.6", features = ["axum"] }
 tower-service = "0.3.3"

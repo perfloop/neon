@@ -70,6 +70,9 @@ use crate::context::{
     DownloadBehavior, PerfInstrumentFutureExt, RequestContext, RequestContextBuilder,
 };
 use crate::feature_resolver::FeatureResolver;
+use crate::grpc_request_compression::BoundedGrpcRequestCompression;
+#[cfg(feature = "testing")]
+use crate::grpc_request_compression::IngressObservation;
 use crate::metrics::{
     self, COMPUTE_COMMANDS_COUNTERS, ComputeCommandKind, GetPageBatchBreakReason, LIVE_CONNECTIONS,
     MISROUTED_PAGESTREAM_REQUESTS, PAGESTREAM_HANDLER_RESULTS_TOTAL, SmgrOpTimer, TimelineMetrics,
@@ -135,11 +138,16 @@ const MAX_GET_PAGES_RESPONSE_PAGES: usize = (GRPC_MAX_ENCODING_MESSAGE_SIZE
     / GET_PAGES_RESPONSE_PAGE_WIRE_BYTES;
 
 // The public response limit permits this many requested blocks. A GetPageRequest with every
-// possible fixed field at its maximum encoded width uses 80 bytes; an unpacked maximum-width
-// uint32 block number uses six bytes. Tonic applies this cap to an identity gRPC body before
-// Prost allocates the repeated block-number Vec. The PageService-wide cap also covers its other
-// request messages, whose fields are all fixed-size and substantially smaller.
-const GRPC_MAX_GET_PAGES_DECODING_MESSAGE_SIZE: usize = MAX_GET_PAGES_RESPONSE_PAGES * 6 + 80;
+// possible fixed field at its maximum encoded width uses 80 bytes. A maximum-width uint32 costs
+// six bytes in the unpacked form; reserve seven so a legal one-value packed segment (tag, length,
+// and value) also fits for every requested block. The bounded request-decompression layer
+// enforces this decoded-message cap on GetPages before Tonic/Prost can materialize the repeated
+// block-number Vec. Other PageService methods retain Tonic's ordinary inbound-message policy.
+const GRPC_MAX_GET_PAGES_DECODING_MESSAGE_SIZE: usize = MAX_GET_PAGES_RESPONSE_PAGES * 7 + 80;
+// Tonic 0.13's default receive limit is 4 MiB. Retaining that established wire cap means a
+// compression-configured client is not newly rejected for encoding overhead, while the layer's
+// decoded GetPages cap prevents a compressed frame from expanding into a large protobuf Vec.
+const GRPC_MAX_COMPRESSED_REQUEST_MESSAGE_SIZE: usize = GRPC_MAX_ENCODING_MESSAGE_SIZE;
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -3410,17 +3418,19 @@ impl GrpcPageServiceHandler {
                 Ok(req)
             }))
             // Run the page service.
-            .service(
+            .service(BoundedGrpcRequestCompression::new(
                 proto::PageServiceServer::new(page_service_handler)
                     .max_encoding_message_size(GRPC_MAX_ENCODING_MESSAGE_SIZE)
-                    // Incoming PageService frames use identity encoding. In Tonic 0.13, a receive
-                    // limit is applied to compressed bytes before decompression, so accepting gzip
-                    // or zstd here would let a compressed request bypass this GetPages allocation
-                    // bound. Responses may still use either encoding.
-                    .max_decoding_message_size(GRPC_MAX_GET_PAGES_DECODING_MESSAGE_SIZE)
+                    // The layer immediately below transforms bounded GetPages request frames to
+                    // identity before Tonic/Prost sees them. Keep both negotiated request
+                    // encodings for established clients and for the other PageService methods.
+                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
                     .send_compressed(tonic::codec::CompressionEncoding::Gzip)
                     .send_compressed(tonic::codec::CompressionEncoding::Zstd),
-            );
+                GRPC_MAX_GET_PAGES_DECODING_MESSAGE_SIZE,
+                GRPC_MAX_COMPRESSED_REQUEST_MESSAGE_SIZE,
+            ));
         let server = server.add_service(page_service);
 
         // Reflection service for use with e.g. grpcurl.
@@ -3996,6 +4006,8 @@ impl proto::PageService for GrpcPageServiceHandler {
             timeline_id,
         } = *extract::<TenantTimelineId>(&req);
         let shard_index = *extract::<ShardIndex>(&req);
+        #[cfg(feature = "testing")]
+        let ingress_observation = req.extensions().get::<IngressObservation>().cloned();
 
         let mut handles = TimelineHandles::new(self.tenant_manager.clone());
         let timeline = match handles
@@ -4049,10 +4061,19 @@ impl proto::PageService for GrpcPageServiceHandler {
                     let req = page_api::GetPageRequest::try_from(req)?;
                     #[cfg(feature = "testing")]
                     if fail::eval("ps::grpc-get-pages-after-decode", |_| ()).is_some() {
+                        let observation = ingress_observation
+                            .as_ref()
+                            .map(IngressObservation::finish)
+                            .unwrap_or(IngressObservation::unobserved_measurement());
                         return Err(tonic::Status::invalid_argument(format!(
-                            "injected GetPages post-decode frame: blocks={}, capacity_bytes={}",
+                            "injected GetPages post-decode frame: blocks={}, capacity_bytes={}, \
+                             server_ingress_thread_allocated_bytes={}, \
+                             server_ingress_thread_allocation_observed={}, server_elapsed_ns={}",
                             req.block_numbers.len(),
                             req.block_numbers.capacity() * std::mem::size_of::<u32>(),
+                            observation.ingress_thread_allocated_bytes,
+                            observation.ingress_thread_allocation_observed,
+                            observation.elapsed_ns,
                         )));
                     }
                     // Keep this on the original public frame: stale-parent routing splits it into

@@ -8,7 +8,7 @@ license.workspace = true
 default = []
 # Enables test-only APIs, incuding failpoints. In particular, enables the `fail_point!` macro,
 # which adds some runtime cost to run tests on outage conditions
-testing = ["fail/failpoints", "pageserver_api/testing", "wal_decoder/testing", "pageserver_client/testing"]
+testing = ["fail/failpoints", "pageserver_api/testing", "wal_decoder/testing", "pageserver_client/testing", "utils/testing", "dep:tikv-jemalloc-ctl"]
 
 # Direct IO alignment options (propagated to pageserver_api)
 io-align-512 = ["pageserver_api/io-align-512"]
@@ -38,10 +38,13 @@ either.workspace = true
 enum-map.workspace = true
 enumset = { workspace = true, features = ["serde"]}
 fail.workspace = true
+flate2.workspace = true
 futures.workspace = true
 hashlink.workspace = true
 hex.workspace = true
 http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
 http-utils.workspace = true
 humantime-serde.workspace = true
 humantime.workspace = true
@@ -91,6 +94,7 @@ sysinfo.workspace = true
 tenant_size_model.workspace = true
 thiserror.workspace = true
 tikv-jemallocator.workspace = true
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["process", "sync", "fs", "rt", "io-util", "time"] }
 tokio-epoll-uring.workspace = true
 tokio-io-timeout.workspace = true
@@ -111,6 +115,7 @@ wal_decoder.workspace = true
 walkdir.workspace = true
 workspace_hack.workspace = true
 twox-hash.workspace = true
+zstd.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs.workspace = true

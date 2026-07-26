@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import pytest
 from fixtures.common_types import Lsn, TenantShardId
 from fixtures.neon_fixtures import wait_for_last_flush_lsn
 from fixtures.utils import wait_until
@@ -16,9 +18,29 @@ if TYPE_CHECKING:
 
 CAP = 32
 MAX_RESPONSE_PAGES = 511
-MAX_GET_PAGES_DECODING_MESSAGE_SIZE = MAX_RESPONSE_PAGES * 6 + 80
+MAX_GET_PAGES_DECODING_MESSAGE_SIZE = MAX_RESPONSE_PAGES * 7 + 80
+# The bounded zstd decoder permits a 2 MiB window. This 4 MiB cap leaves space for its observed
+# workspace and the bounded output buffer while still failing if an ingress decoder regresses to a
+# much larger allocation before protobuf materialization.
+MAX_INGRESS_DECOMPRESSION_THREAD_ALLOCATION_BYTES = 4 * 1024 * 1024
 SMGR = "pageserver_smgr_query_started_count_total"
 VECTORED = "pageserver_get_vectored_seconds_count"
+
+
+@pytest.fixture(autouse=True)
+def retain_contract_controls_in_command_output():
+    """Keep the serial proof record below the controller's output cap.
+
+    The test explicitly emits its correctness and performance controls as JSON. Fixture INFO
+    narration is neither an oracle nor evidence and can otherwise displace those controls from
+    the sealed command's captured output.
+    """
+    previous_disable_level = logging.root.manager.disable
+    logging.disable(logging.INFO)
+    try:
+        yield
+    finally:
+        logging.disable(previous_disable_level)
 
 
 def metric(env: NeonEnv, name: str, filters: dict[str, str]) -> float:
@@ -93,6 +115,7 @@ def run(
     shard_number: int = 0,
     shard_count: int = 0,
     ingress_compression: str = "identity",
+    client_compression: str = "identity",
 ) -> dict[str, Any]:
     dbnode, spcnode, relnode = relation
     binary = frame_contract_binary(neon_binpath)
@@ -126,6 +149,8 @@ def run(
         str(shard_count),
         "--ingress-compression",
         ingress_compression,
+        "--client-compression",
+        client_compression,
     ]
     if repeat_block is not None:
         command.extend(("--repeat-block", str(repeat_block)))
@@ -160,6 +185,7 @@ def sample_direct_frame(
     size: int,
     *,
     repeat_block: int | None = None,
+    client_compression: str = "identity",
 ) -> tuple[dict[str, Any], float, float, int]:
     filters = frame_filters(env)
     frame_contract_binary(neon_binpath)
@@ -174,6 +200,7 @@ def sample_direct_frame(
         size,
         "raw",
         repeat_block=repeat_block,
+        client_compression=client_compression,
     )
     timer_starts = metric(env, SMGR, filters) - before_timers
     vectored_calls = metric(env, VECTORED, {"task_kind": "PageRequestHandler"}) - before_vectored
@@ -218,7 +245,7 @@ def assert_inbound_frame_bound(
     lsn: Lsn,
     relation: tuple[int, int, int],
 ) -> None:
-    """Exercise the identity decoder cap and rejected compressed expansion before page work."""
+    """Measure bounded identity decoding and bounded gzip/zstd expansion before page work."""
 
     client = env.pageserver.http_client()
     failpoint = "ps::grpc-get-pages-after-decode"
@@ -227,9 +254,49 @@ def assert_inbound_frame_bound(
     before_vectored = metric(env, VECTORED, {"task_kind": "PageRequestHandler"})
     client.configure_failpoints((failpoint, "return"))
     try:
+
+        def assert_server_observation(result: dict[str, Any]) -> None:
+            # The test-only ingress layer records allocations made synchronously by the bounded
+            # forwarding task, then reports that scoped counter with elapsed server ingress time.
+            assert isinstance(result["server_ingress_thread_allocated_bytes"], int), result
+            assert (
+                0
+                <= result["server_ingress_thread_allocated_bytes"]
+                <= MAX_INGRESS_DECOMPRESSION_THREAD_ALLOCATION_BYTES
+            ), result
+            if result["compression"] != "identity":
+                assert result["server_ingress_thread_allocation_observed"] is True, result
+            assert isinstance(result["server_elapsed_ns"], int), result
+            assert result["server_elapsed_ns"] > 0, result
+
+        # A response-admissible maximum frame with maximum-width block values must still reach
+        # the post-decode hook. The request is intentionally otherwise invalid, so the hook can
+        # establish ingress admission without attempting page work for block u32::MAX.
+        maximum_width = run(
+            pg_bin,
+            neon_binpath,
+            env,
+            lsn,
+            relation,
+            MAX_RESPONSE_PAGES,
+            "ingress",
+            repeat_block=2**32 - 1,
+        )
+        assert maximum_width["uncompressed_proto_bytes"] <= MAX_GET_PAGES_DECODING_MESSAGE_SIZE
+        assert maximum_width["response_status"] == "invalid_request"
+        assert maximum_width["response_pages"] == 0
+        assert maximum_width["transport_status"] is None
+        assert maximum_width["post_decode_reached"]
+        assert maximum_width["post_decode_blocks"] == MAX_RESPONSE_PAGES
+        assert_server_observation(maximum_width)
+        emit_control_metric(
+            "grpc_get_pages_decoder_max_width_511_proto_bytes",
+            maximum_width["uncompressed_proto_bytes"],
+        )
+
         # Find adjacent packed repeated-field frame sizes from their actual protobuf encodings.
         # Requests below the cap reach the post-decode hook, which returns the server Vec capacity;
-        # requests above it must be rejected by Tonic before that hook can run.
+        # requests above it must be rejected before that hook can run.
         below_count = 1
         above_count = MAX_GET_PAGES_DECODING_MESSAGE_SIZE + 1
         while below_count + 1 < above_count:
@@ -251,11 +318,13 @@ def assert_inbound_frame_bound(
                 assert result["post_decode_reached"]
                 assert result["post_decode_blocks"] == count
                 assert result["decoded_block_numbers_capacity_bytes"] >= count * 4
+                assert_server_observation(result)
                 below_count = count
             else:
                 assert result["response_status"] is None
                 assert result["transport_status"] == "out_of_range"
                 assert not result["post_decode_reached"]
+                assert_server_observation(result)
                 above_count = count
 
         below = run(
@@ -288,15 +357,73 @@ def assert_inbound_frame_bound(
         assert below["post_decode_blocks"] == below_count
         assert below["decoded_block_numbers_capacity_bytes"] >= below_count * 4
         assert below["request_elapsed_ns"] > 0
+        assert_server_observation(below)
         assert above["response_status"] is None
         assert above["transport_status"] == "out_of_range"
         assert not above["post_decode_reached"]
         assert above["request_elapsed_ns"] > 0
+        assert_server_observation(above)
 
-        # These generated-client requests carry real gzip/zstd gRPC frames. A highly
-        # compressible body hundreds of times larger than the identity cap remains below that cap
-        # on the wire. PageService rejects the unsupported request encoding before Tonic
-        # decompression and before the post-decode hook can observe a repeated-field Vec.
+        # These generated clients emit real gzip/zstd gRPC wire frames. Exercise the adjacent
+        # decoded boundary for each accepted encoding: the bounded frame reaches Prost, while the
+        # next packed repeated-field frame is rejected by ingress before the Vec can materialize.
+        for compression in ("gzip", "zstd"):
+            compatible = run(
+                pg_bin,
+                neon_binpath,
+                env,
+                lsn,
+                relation,
+                below_count,
+                "ingress",
+                repeat_block=0,
+                ingress_compression=compression,
+            )
+            over_limit = run(
+                pg_bin,
+                neon_binpath,
+                env,
+                lsn,
+                relation,
+                above_count,
+                "ingress",
+                repeat_block=0,
+                ingress_compression=compression,
+            )
+            assert compatible["compression"] == compression
+            assert compatible["response_status"] == "invalid_request"
+            assert compatible["response_pages"] == 0
+            assert compatible["transport_status"] is None
+            assert compatible["post_decode_reached"]
+            assert compatible["post_decode_blocks"] == below_count
+            assert_server_observation(compatible)
+            assert over_limit["compression"] == compression
+            assert over_limit["uncompressed_proto_bytes"] > MAX_GET_PAGES_DECODING_MESSAGE_SIZE
+            assert over_limit["response_status"] is None
+            assert over_limit["transport_status"] == "out_of_range"
+            assert not over_limit["post_decode_reached"]
+            assert_server_observation(over_limit)
+            for boundary, result in (("near_limit", compatible), ("over_limit", over_limit)):
+                emit_control_metric(
+                    f"grpc_get_pages_{compression}_decoder_{boundary}_proto_bytes",
+                    result["uncompressed_proto_bytes"],
+                )
+                emit_control_metric(
+                    f"grpc_get_pages_{compression}_decoder_{boundary}_server_ingress_thread_allocated_bytes",
+                    result["server_ingress_thread_allocated_bytes"],
+                )
+                emit_control_metric(
+                    f"grpc_get_pages_{compression}_decoder_{boundary}_server_elapsed_ns",
+                    result["server_elapsed_ns"],
+                )
+                emit_control_metric(
+                    f"grpc_get_pages_{compression}_decoder_{boundary}_request_ns",
+                    result["request_elapsed_ns"],
+                )
+
+        # A highly compressible body hundreds of times larger than the decoded cap is still small
+        # on the wire. The bounded ingress layer must reject it before Prost materializes the
+        # repeated-field Vec, while retaining server allocation and elapsed-time observations.
         compressed_count = above_count * 256
         for compression in ("gzip", "zstd"):
             compressed = run(
@@ -317,9 +444,10 @@ def assert_inbound_frame_bound(
             )
             assert compressed["compressed_payload_bytes"] < MAX_GET_PAGES_DECODING_MESSAGE_SIZE
             assert compressed["response_status"] is None
-            assert compressed["transport_status"] == "unimplemented"
+            assert compressed["transport_status"] == "out_of_range"
             assert not compressed["post_decode_reached"]
             assert compressed["request_elapsed_ns"] > 0
+            assert_server_observation(compressed)
             emit_control_metric(
                 f"grpc_get_pages_{compression}_compressed_expansion_proto_bytes",
                 compressed["uncompressed_proto_bytes"],
@@ -327,6 +455,14 @@ def assert_inbound_frame_bound(
             emit_control_metric(
                 f"grpc_get_pages_{compression}_compressed_expansion_payload_bytes",
                 compressed["compressed_payload_bytes"],
+            )
+            emit_control_metric(
+                f"grpc_get_pages_{compression}_compressed_expansion_server_ingress_thread_allocated_bytes",
+                compressed["server_ingress_thread_allocated_bytes"],
+            )
+            emit_control_metric(
+                f"grpc_get_pages_{compression}_compressed_expansion_server_elapsed_ns",
+                compressed["server_elapsed_ns"],
             )
             emit_control_metric(
                 f"grpc_get_pages_{compression}_compressed_expansion_request_ns",
@@ -342,8 +478,24 @@ def assert_inbound_frame_bound(
             below["decoded_block_numbers_capacity_bytes"],
         )
         emit_control_metric(
+            "grpc_get_pages_identity_decoder_near_limit_server_ingress_thread_allocated_bytes",
+            below["server_ingress_thread_allocated_bytes"],
+        )
+        emit_control_metric(
+            "grpc_get_pages_identity_decoder_near_limit_server_elapsed_ns",
+            below["server_elapsed_ns"],
+        )
+        emit_control_metric(
             "grpc_get_pages_identity_decoder_near_limit_request_ns",
             below["request_elapsed_ns"],
+        )
+        emit_control_metric(
+            "grpc_get_pages_identity_decoder_over_limit_server_ingress_thread_allocated_bytes",
+            above["server_ingress_thread_allocated_bytes"],
+        )
+        emit_control_metric(
+            "grpc_get_pages_identity_decoder_over_limit_server_elapsed_ns",
+            above["server_elapsed_ns"],
         )
         emit_control_metric(
             "grpc_get_pages_identity_decoder_over_limit_request_ns",
@@ -432,6 +584,10 @@ def assert_frame_holds_gc_cutoff(
                 ),
                 timeout=20,
             )
+            assert gc_completion is not None
+            assert not gc_completion.done(), (
+                "GC completed after storing the cutoff while the public GetPages frame remained paused"
+            )
         finally:
             client.configure_failpoints((frame_failpoint, "off"))
             client.configure_failpoints((gc_phase_failpoint, "off"))
@@ -456,14 +612,44 @@ def test_grpc_get_pages_frame_contract(
         r".*grpc:pageservice.*request failed with (Internal|InvalidArgument|OutOfRange|Unimplemented):.*"
     )
 
+    # Establish a resident relation before each control snapshots its counters. This is deliberately
+    # outside the controls: each control below still independently byte-verifies its references and
+    # asserts the exact timer/vector delta of its own public frame.
+    warmup = run(pg_bin, neon_binpath, env, lsn, relation, 1, "raw")
+    assert_ok(warmup, 1)
+
+    # Exercise established compressed GetPages clients on the successful over-cap destinations.
+    # The helper's typed client both sends compressed requests and accepts compressed responses.
     direct_33, timer_starts_33, vectored_33, elapsed_33 = sample_direct_frame(
-        pg_bin, neon_binpath, env, lsn, relation, CAP + 1
+        pg_bin, neon_binpath, env, lsn, relation, CAP + 1, client_compression="zstd"
+    )
+    # A currently configured gzip client must complete a real frame too, not merely reach the
+    # post-decode ingress failpoint below.
+    direct_33_gzip, timer_starts_33_gzip, vectored_33_gzip, elapsed_33_gzip = sample_direct_frame(
+        pg_bin, neon_binpath, env, lsn, relation, CAP + 1, client_compression="gzip"
     )
     direct_100, timer_starts_100, vectored_100, elapsed_100 = sample_direct_frame(
-        pg_bin, neon_binpath, env, lsn, relation, 100
+        pg_bin, neon_binpath, env, lsn, relation, 100, client_compression="zstd"
+    )
+    direct_100_gzip, timer_starts_100_gzip, vectored_100_gzip, elapsed_100_gzip = (
+        sample_direct_frame(
+            pg_bin, neon_binpath, env, lsn, relation, 100, client_compression="gzip"
+        )
     )
     direct_255, timer_starts_255, vectored_255, elapsed_255 = sample_direct_frame(
-        pg_bin, neon_binpath, env, lsn, relation, 255, repeat_block=0
+        pg_bin, neon_binpath, env, lsn, relation, 255, repeat_block=0, client_compression="zstd"
+    )
+    direct_255_gzip, timer_starts_255_gzip, vectored_255_gzip, elapsed_255_gzip = (
+        sample_direct_frame(
+            pg_bin,
+            neon_binpath,
+            env,
+            lsn,
+            relation,
+            255,
+            repeat_block=0,
+            client_compression="gzip",
+        )
     )
     direct_at_limit, timer_starts_511, vectored_511, elapsed_511 = sample_direct_frame(
         pg_bin,
@@ -477,14 +663,25 @@ def test_grpc_get_pages_frame_contract(
 
     for result, size in (
         (direct_33, CAP + 1),
+        (direct_33_gzip, CAP + 1),
         (direct_100, 100),
+        (direct_100_gzip, 100),
         (direct_255, 255),
+        (direct_255_gzip, 255),
         (direct_at_limit, MAX_RESPONSE_PAGES),
     ):
         assert_ok(result, size)
+    for result in (direct_33, direct_100, direct_255):
+        assert result["client_compression"] == "zstd"
+    for result in (direct_33_gzip, direct_100_gzip, direct_255_gzip):
+        assert result["client_compression"] == "gzip"
+    assert direct_at_limit["client_compression"] == "identity"
     assert (timer_starts_33, vectored_33) == (CAP + 1, 2)
+    assert (timer_starts_33_gzip, vectored_33_gzip) == (CAP + 1, 2)
     assert (timer_starts_100, vectored_100) == (100, 4)
+    assert (timer_starts_100_gzip, vectored_100_gzip) == (100, 4)
     assert (timer_starts_255, vectored_255) == (255, 8)
+    assert (timer_starts_255_gzip, vectored_255_gzip) == (255, 8)
     assert (timer_starts_511, vectored_511) == (MAX_RESPONSE_PAGES, 16)
 
     filters = frame_filters(env)
@@ -525,6 +722,18 @@ def test_grpc_get_pages_frame_contract(
         )
         emit_control_metric(f"server_get_vectored_calls_per_direct_{size}_frame", vectored_calls)
         emit_control_metric(f"grpc_get_pages_direct_{size}_request_ns", elapsed_ns)
+    for size, result, vectored_calls, elapsed_ns in (
+        (CAP + 1, direct_33_gzip, vectored_33_gzip, elapsed_33_gzip),
+        (100, direct_100_gzip, vectored_100_gzip, elapsed_100_gzip),
+        (255, direct_255_gzip, vectored_255_gzip, elapsed_255_gzip),
+    ):
+        emit_control_metric(
+            f"grpc_get_pages_gzip_direct_{size}_returned_pages", result["response_pages"]
+        )
+        emit_control_metric(
+            f"server_get_vectored_calls_per_gzip_direct_{size}_frame", vectored_calls
+        )
+        emit_control_metric(f"grpc_get_pages_gzip_direct_{size}_request_ns", elapsed_ns)
     print("verified_grpc_get_pages_frame_contract")
 
 

@@ -4532,11 +4532,14 @@ dependencies = [
  "enum-map",
  "enumset",
  "fail",
+ "flate2",
  "futures",
  "hashlink",
  "hex",
  "hex-literal",
  "http 1.3.1",
+ "http-body 1.0.0",
+ "http-body-util",
  "http-utils",
  "humantime",
  "humantime-serde",
@@ -4588,6 +4591,7 @@ dependencies = [
  "sysinfo",
  "tenant_size_model",
  "thiserror 1.0.69",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tokio-epoll-uring",
@@ -4610,6 +4614,7 @@ dependencies = [
  "wal_decoder",
  "walkdir",
  "workspace_hack",
+ "zstd",
 ]
 
 [[package]]

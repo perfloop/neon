@@ -45,6 +45,14 @@ impl IngressCompression {
             Self::Zstd => "zstd",
         }
     }
+
+    fn tonic(self) -> Option<CompressionEncoding> {
+        match self {
+            Self::Identity => None,
+            Self::Gzip => Some(CompressionEncoding::Gzip),
+            Self::Zstd => Some(CompressionEncoding::Zstd),
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -81,6 +89,9 @@ struct Args {
     mode: Mode,
     #[arg(long, value_enum, default_value_t = IngressCompression::Identity)]
     ingress_compression: IngressCompression,
+    /// Compression used by normal typed GetPages frame controls in non-ingress modes.
+    #[arg(long, value_enum, default_value_t = IngressCompression::Identity)]
+    client_compression: IngressCompression,
 }
 
 fn blocks(args: &Args) -> anyhow::Result<Vec<u32>> {
@@ -226,6 +237,7 @@ fn emit(
     mismatches: usize,
     reference_pages: usize,
     request_elapsed_ns: u128,
+    client_compression: IngressCompression,
 ) {
     println!(
         "{}",
@@ -237,6 +249,7 @@ fn emit(
             "image_byte_mismatches": mismatches,
             "reference_pages": reference_pages,
             "request_elapsed_ns": request_elapsed_ns,
+            "client_compression": client_compression.name(),
         })
     );
 }
@@ -281,13 +294,39 @@ fn compressed_payload_bytes(
     })
 }
 
-fn post_decode_allocation(reason: Option<&str>) -> Option<(usize, usize)> {
-    let reason = reason?.strip_prefix(POST_DECODE_PREFIX)?;
-    let (blocks, capacity_bytes) = reason.split_once(", capacity_bytes=")?;
-    Some((
-        blocks.strip_prefix("blocks=")?.parse().ok()?,
-        capacity_bytes.parse().ok()?,
-    ))
+#[derive(Default)]
+struct IngressObservation {
+    blocks: Option<usize>,
+    capacity_bytes: Option<usize>,
+    server_ingress_thread_allocated_bytes: Option<u64>,
+    server_ingress_thread_allocation_observed: Option<bool>,
+    server_elapsed_ns: Option<u128>,
+}
+
+fn parse_ingress_observation(reason: Option<&str>) -> IngressObservation {
+    let Some(reason) = reason else {
+        return IngressObservation::default();
+    };
+    let reason = reason.strip_prefix(POST_DECODE_PREFIX).unwrap_or(reason);
+    let mut observation = IngressObservation::default();
+    for field in reason.replace("; ", ", ").split(", ") {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key {
+            "blocks" => observation.blocks = value.parse().ok(),
+            "capacity_bytes" => observation.capacity_bytes = value.parse().ok(),
+            "server_ingress_thread_allocated_bytes" => {
+                observation.server_ingress_thread_allocated_bytes = value.parse().ok()
+            }
+            "server_ingress_thread_allocation_observed" => {
+                observation.server_ingress_thread_allocation_observed = value.parse().ok()
+            }
+            "server_elapsed_ns" => observation.server_elapsed_ns = value.parse().ok(),
+            _ => {}
+        }
+    }
+    observation
 }
 
 async fn run_ingress(args: &Args, rel: page_api::RelTag, blocks: Vec<u32>) -> anyhow::Result<()> {
@@ -305,7 +344,7 @@ async fn run_ingress(args: &Args, rel: page_api::RelTag, blocks: Vec<u32>) -> an
         .context("invalid GetPages endpoint")?
         .connect()
         .await
-        .context("connect raw GetPages client")?;
+        .context("connect generated GetPages client")?;
     let mut client = page_api::proto::PageServiceClient::with_interceptor(
         channel,
         move |mut request: tonic::Request<()>| {
@@ -313,17 +352,17 @@ async fn run_ingress(args: &Args, rel: page_api::RelTag, blocks: Vec<u32>) -> an
             metadata.insert("neon-tenant-id", tenant_id.clone());
             metadata.insert("neon-timeline-id", timeline_id.clone());
             metadata.insert("neon-shard-id", shard_id.clone());
+            // The server strips this test-only header before dispatch. It asks its bounded ingress
+            // layer to attach allocation and elapsed-time observations to the test response.
+            metadata.insert(
+                "neon-test-ingress-observe",
+                AsciiMetadataValue::from_static("1"),
+            );
             Ok(request)
         },
     );
-    match args.ingress_compression {
-        IngressCompression::Identity => {}
-        IngressCompression::Gzip => {
-            client = client.send_compressed(CompressionEncoding::Gzip);
-        }
-        IngressCompression::Zstd => {
-            client = client.send_compressed(CompressionEncoding::Zstd);
-        }
+    if let Some(compression) = args.ingress_compression.tonic() {
+        client = client.send_compressed(compression);
     }
 
     let (tx, rx) = mpsc::channel(1);
@@ -335,29 +374,40 @@ async fn run_ingress(args: &Args, rel: page_api::RelTag, blocks: Vec<u32>) -> an
     let mut transport_message = None;
     let mut post_decode_blocks = None;
     let mut decoded_block_numbers_capacity_bytes = None;
+    let mut server_ingress_thread_allocated_bytes = None;
+    let mut server_ingress_thread_allocation_observed = None;
+    let mut server_elapsed_ns = None;
     match client.get_pages(ReceiverStream::new(rx)).await {
         Ok(response) => {
             tx.send(request)
                 .await
-                .context("send raw GetPages request")?;
+                .context("send generated GetPages request")?;
             match response.into_inner().next().await {
                 Some(Ok(response)) => {
                     let response: page_api::GetPageResponse = response
                         .try_into()
-                        .context("decode raw GetPages response")?;
+                        .context("decode generated GetPages response")?;
                     response_status = Some(status(&response));
                     response_reason = response.reason.clone();
                     response_pages = Some(response.pages.len());
-                    if let Some((blocks, capacity_bytes)) =
-                        post_decode_allocation(response.reason.as_deref())
-                    {
-                        post_decode_blocks = Some(blocks);
-                        decoded_block_numbers_capacity_bytes = Some(capacity_bytes);
-                    }
+                    let observation = parse_ingress_observation(response.reason.as_deref());
+                    post_decode_blocks = observation.blocks;
+                    decoded_block_numbers_capacity_bytes = observation.capacity_bytes;
+                    server_ingress_thread_allocated_bytes =
+                        observation.server_ingress_thread_allocated_bytes;
+                    server_ingress_thread_allocation_observed =
+                        observation.server_ingress_thread_allocation_observed;
+                    server_elapsed_ns = observation.server_elapsed_ns;
                 }
                 Some(Err(status)) => {
                     transport_status = Some(tonic_status_name(status.code()));
                     transport_message = Some(status.message().to_owned());
+                    let observation = parse_ingress_observation(transport_message.as_deref());
+                    server_ingress_thread_allocated_bytes =
+                        observation.server_ingress_thread_allocated_bytes;
+                    server_ingress_thread_allocation_observed =
+                        observation.server_ingress_thread_allocation_observed;
+                    server_elapsed_ns = observation.server_elapsed_ns;
                 }
                 None => {
                     transport_status = Some("stream_ended");
@@ -367,6 +417,12 @@ async fn run_ingress(args: &Args, rel: page_api::RelTag, blocks: Vec<u32>) -> an
         Err(status) => {
             transport_status = Some(tonic_status_name(status.code()));
             transport_message = Some(status.message().to_owned());
+            let observation = parse_ingress_observation(transport_message.as_deref());
+            server_ingress_thread_allocated_bytes =
+                observation.server_ingress_thread_allocated_bytes;
+            server_ingress_thread_allocation_observed =
+                observation.server_ingress_thread_allocation_observed;
+            server_elapsed_ns = observation.server_elapsed_ns;
         }
     }
 
@@ -387,6 +443,9 @@ async fn run_ingress(args: &Args, rel: page_api::RelTag, blocks: Vec<u32>) -> an
             "post_decode_reached": post_decode_blocks.is_some(),
             "post_decode_blocks": post_decode_blocks,
             "decoded_block_numbers_capacity_bytes": decoded_block_numbers_capacity_bytes,
+            "server_ingress_thread_allocated_bytes": server_ingress_thread_allocated_bytes,
+            "server_ingress_thread_allocation_observed": server_ingress_thread_allocation_observed,
+            "server_elapsed_ns": server_elapsed_ns,
         })
     );
     Ok(())
@@ -412,7 +471,7 @@ async fn main() -> anyhow::Result<()> {
         args.timeline_id,
         ShardIndex::new(ShardNumber(args.shard_number), ShardCount(args.shard_count)),
         None,
-        None,
+        args.client_compression.tonic(),
     )
     .await
     .context("connect GetPages client")?;
@@ -484,7 +543,7 @@ async fn main() -> anyhow::Result<()> {
             if response.status_code == page_api::GetPageStatusCode::Ok {
                 validate(&response, &expected)?;
             }
-            emit(&response, 0, 0, request_elapsed_ns);
+            emit(&response, 0, 0, request_elapsed_ns, args.client_compression);
         }
         Mode::Raw => {
             // Obtain one independent single-page image for each distinct requested block before
@@ -512,7 +571,13 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 0
             };
-            emit(&response, mismatches, references.len(), request_elapsed_ns);
+            emit(
+                &response,
+                mismatches,
+                references.len(),
+                request_elapsed_ns,
+                args.client_compression,
+            );
         }
         Mode::Suffix => {
             let suffix = args

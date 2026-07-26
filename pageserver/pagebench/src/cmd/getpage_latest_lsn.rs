@@ -49,7 +49,7 @@ pub(crate) struct Args {
     num_clients: NonZeroUsize,
     #[clap(long)]
     runtime: Option<humantime::Duration>,
-    /// If true, accept zstd-compressed responses (only for gRPC).
+    /// If true, enable zstd compression (only for gRPC).
     #[clap(long)]
     compression: bool,
     /// Each client sends requests at the given rate.
